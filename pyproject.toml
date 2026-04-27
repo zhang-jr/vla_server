@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vla-runtime"
+version = "0.1.0.dev0"
+description = "Model-agnostic VLA serving runtime — vLLM for VLA models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+keywords = ["vla", "robotics", "inference", "serving", "llm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "pydantic>=2.0",
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+# Cloud serving backends
+vllm = ["vllm>=0.4.0"]
+sglang = ["sglang>=0.1.0"]
+lmdeploy = ["lmdeploy>=0.4.0"]
+
+# Edge deployment
+edge = ["llama-cpp-python>=0.2.0"]
+
+# Kernel acceleration
+triton-dev = ["triton>=2.3.0"]
+tensorrt = ["tensorrt>=10.0"]
+
+# Testing
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-benchmark>=4.0",
+]
+
+# Full development environment
+dev = [
+    "vla-runtime[test,triton-dev]",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.urls]
+Repository = "https://github.com/youran-lab/vla-runtime"
+
+# ── Tool configuration ────────────────────────────────────────────────────────
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vla_runtime*", "kernels*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "gpu: requires a CUDA-capable GPU",
+    "slow: slow tests (> 10s)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]   # long lines handled by formatter
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
