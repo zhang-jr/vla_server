@@ -41,9 +41,25 @@ except ImportError:
     _triton_available = False
 
 
+# ── Autotune configs ──────────────────────────────────────────────────────────
+# Triton will benchmark each config on first call and cache the winner.
+# Configs target the typical VLA action dimension range: 7-256.
+
+_EULER_AUTOTUNE_CONFIGS = []
+if _triton_available:
+    _EULER_AUTOTUNE_CONFIGS = [
+        triton.Config({"BLOCK_D": 64}),
+        triton.Config({"BLOCK_D": 128}),
+        triton.Config({"BLOCK_D": 256}),
+        triton.Config({"BLOCK_D": 512}),
+        triton.Config({"BLOCK_D": 1024}),
+    ]
+
+
 # ── Kernel definition ─────────────────────────────────────────────────────────
 
 if _triton_available:
+    @triton.autotune(configs=_EULER_AUTOTUNE_CONFIGS, key=["D"])
     @triton.jit
     def _euler_step_kernel(
         z_ptr,          # [B, D] float16, input noise state
@@ -102,15 +118,12 @@ def flow_matching_euler_step(
         # PyTorch fallback — correctness-equivalent, not optimised
         return z_t + velocity * dt
 
-    # Choose BLOCK_D as the next power-of-2 ≥ D, capped at 1024
-    block_d = min(triton.next_power_of_2(D), 1024)
-
     out = torch.empty_like(z_t)
+    # BLOCK_D is selected by autotuner; pass D as the key for cache lookup.
     _euler_step_kernel[(B,)](
         z_t, velocity, out,
         dt,
         D=D,
-        BLOCK_D=block_d,
     )
     return out
 

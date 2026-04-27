@@ -34,9 +34,22 @@ except ImportError:
     _triton_available = False
 
 
+# ── Autotune configs ──────────────────────────────────────────────────────────
+_DDPM_AUTOTUNE_CONFIGS = []
+if _triton_available:
+    _DDPM_AUTOTUNE_CONFIGS = [
+        triton.Config({"BLOCK_D": 64}),
+        triton.Config({"BLOCK_D": 128}),
+        triton.Config({"BLOCK_D": 256}),
+        triton.Config({"BLOCK_D": 512}),
+        triton.Config({"BLOCK_D": 1024}),
+    ]
+
+
 # ── Kernel definition ─────────────────────────────────────────────────────────
 
 if _triton_available:
+    @triton.autotune(configs=_DDPM_AUTOTUNE_CONFIGS, key=["D"])
     @triton.jit
     def _ddpm_step_kernel(
         x_t_ptr,            # [B, D] float16, noisy sample at step t
@@ -103,11 +116,11 @@ def ddpm_step(
 
     noise = torch.randn_like(x_t) if sigma_t > 0 else torch.zeros_like(x_t)
     out = torch.empty_like(x_t)
-    block_d = min(triton.next_power_of_2(D), 1024)
+    # BLOCK_D selected by autotuner keyed on D.
     _ddpm_step_kernel[(B,)](
         x_t, noise_pred, out, noise,
         sqrt_ab_t, sqrt_1m_ab_t, sqrt_ab_prev, sigma_t,
-        D=D, BLOCK_D=block_d,
+        D=D,
     )
     return out
 
