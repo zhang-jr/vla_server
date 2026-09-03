@@ -44,8 +44,7 @@ class _MockVLM:
     kv_cache_enabled: bool = False
 
     async def encode(self, image, text) -> Embedding:
-        import time
-        return Embedding(tensor=torch.zeros(1, 32), model_id="mock", timestamp=time.time())
+        return Embedding(data=torch.zeros(1, 32), model_id="mock")
 
     async def generate(self, image, text):
         raise NotImplementedError
@@ -356,6 +355,61 @@ def test_stream_produces_chunk():
         assert len(chunks) == 1
         assert chunks[0].head_type == "flow_matching"
         assert len(head.calls) == 1
+
+        await f.stop()
+
+    asyncio.get_event_loop().run_until_complete(run())
+
+
+# ── Dispatch loop isolation ───────────────────────────────────────────────────
+
+def test_one_bad_request_does_not_kill_the_fleet():
+    """A request that blows up must not stall every other robot forever.
+
+    The dispatch loop is shared by the whole fleet. Before isolation was added,
+    an exception escaping _process_item killed the loop silently: no handle was
+    ever resolved, and every stream() spun until its caller gave up.
+    """
+
+    class _ExplodingVLM(_MockVLM):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def encode(self, image, text) -> Embedding:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("backend exploded")
+            return await super().encode(image, text)
+
+    async def run():
+        vlm = _ExplodingVLM()
+        f = FleetScheduler(
+            vlm_backend=vlm,
+            config=FleetConfig(max_robots=2, vlm_budget_ms=100.0),
+        )
+        await f.start()
+        head_a = _TrackingActionHead("robot_a")
+        head_b = _TrackingActionHead("robot_b")
+        await f.register_robot("robot_a", head_a, priority=1)
+        await f.register_robot("robot_b", head_b, priority=1)
+
+        # First request fails inside the shared dispatch loop.
+        bad = await f.submit("robot_a", _make_request("robot_a"))
+        with pytest.raises(RuntimeError, match="backend exploded"):
+            async for _ in f.stream(bad):
+                pass
+        assert bad.error is not None
+
+        # The loop must still be alive and serving the other robot.
+        good = await f.submit("robot_b", _make_request("robot_b"))
+        chunks = []
+        async for chunk in f.stream(good):
+            chunks.append(chunk)
+
+        assert len(chunks) == 1
+        assert good.error is None
+        assert head_b.calls == ["robot_b"]
+        assert head_a.calls == [], "the failed request must not reach the head"
 
         await f.stop()
 

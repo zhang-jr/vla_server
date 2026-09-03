@@ -318,20 +318,45 @@ class FleetScheduler:
         Args:
             handle: Returned by fleet.submit().
 
+        Queued chunks are drained before the done flag is consulted, so a
+        request that completed before the caller reached stream() still delivers
+        its chunk.
+
         Yields:
             ActionChunk objects as they are produced.
+
+        Raises:
+            Exception: Whatever failed this request in the dispatch loop. The
+                loop records it on the handle instead of raising, so one robot's
+                failure cannot take down the fleet; it surfaces here, to the
+                caller that owns the request.
         """
-        while not handle._done.is_set():
+        while True:
+            if not handle._chunk_queue.empty():
+                chunk = handle._chunk_queue.get_nowait()
+                if chunk is None:
+                    break
+                yield chunk
+                continue
+
+            if handle._done.is_set():
+                break
+
             try:
                 chunk = await asyncio.wait_for(
                     handle._chunk_queue.get(), timeout=2.0
                 )
-                if chunk is None:
-                    break
-                yield chunk
             except asyncio.TimeoutError:
                 if handle._done.is_set():
                     break
+                continue
+
+            if chunk is None:
+                break
+            yield chunk
+
+        if handle.error is not None:
+            raise handle.error
 
     # ── Dispatch loop (shared VLM) ────────────────────────────────────────────
 
@@ -348,7 +373,36 @@ class FleetScheduler:
                     item = heapq.heappop(self._heap)
                     _metrics.gauge("fleet_queue_depth", len(self._heap))
 
-                await self._process_item(item)
+                # One request must never take down the fleet. An escaping
+                # exception would kill this task, leaving every in-flight and
+                # future handle unresolved and every stream() spinning forever
+                # with no signal — so failures are contained per item and the
+                # handle is always released.
+                try:
+                    await self._process_item(item)
+                except asyncio.CancelledError:
+                    item.handle._done.set()
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolation boundary
+                    self._fail_item(item, exc)
+
+    def _fail_item(self, item: _QueueItem, error: Exception) -> None:
+        """Record a failed request and release its handle so stream() terminates.
+
+        The error is attached to the handle rather than raised, because the
+        dispatch loop serves the whole fleet and must survive one robot's bad
+        request. Callers see the failure via ``handle.error``.
+        """
+        item.handle.error = error
+        item.handle._done.set()
+        _metrics.increment("fleet_request_failed")
+        _tracer.event(
+            "fleet_request_failed",
+            robot_id=item.robot_id,
+            request_id=item.request.request_id,
+            error_type=type(error).__name__,
+            error=str(error),
+        )
 
     async def _process_item(self, item: _QueueItem) -> None:
         """Process one queued request: VLM encode → action head predict."""
