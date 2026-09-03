@@ -1,15 +1,15 @@
-"""Unit tests for AsyncScheduler, ChunkBuffer, and BudgetManager.
+"""Unit tests for AsyncScheduler and BudgetManager.
 
 All tests use a MockVLMBackend and real action heads (CPU, small dims).
 No GPU required. Tests cover:
 - Normal inference path: submit → stream → ActionChunk
 - VLM timeout → on_vlm_timeout fallback → stale embedding reuse
 - VLM timeout with no prior embedding → VLMTimeoutError
-- Consecutive timeouts → EmbeddingStaleError
+- Consecutive timeouts → stale-frame accounting in the chunk buffer
 - Action head failure → on_action_head_failure → zero chunk
 - BudgetManager latency recording and violation rate
-- ChunkBuffer double-buffer swap and step consumption
-- ChunkBuffer stale frame counting
+
+ChunkBuffer has its own suite in tests/unit/test_chunk_buffer.py.
 """
 
 from __future__ import annotations
@@ -27,13 +27,11 @@ from vla_runtime.errors import (
     ActionHeadFailureError,
     BackendError,
     BudgetExceededError,
-    EmbeddingStaleError,
     ErrorContext,
     VLMTimeoutError,
 )
 from vla_runtime.scheduler.async_scheduler import AsyncScheduler, RequestHandle
 from vla_runtime.scheduler.budget_manager import BudgetConfig, BudgetManager
-from vla_runtime.scheduler.chunk_buffer import ChunkBuffer
 from vla_runtime.vlm.base import ActionRequest, Embedding, TokenChunk, TokenStream
 
 
@@ -144,93 +142,6 @@ class MockActionHead:
         pass
 
 
-# ── ChunkBuffer tests ─────────────────────────────────────────────────────────
-
-class TestChunkBuffer:
-    def test_initial_state_is_empty(self):
-        buf = ChunkBuffer()
-        assert buf.current() is None
-        assert buf.is_exhausted()
-
-    def test_push_makes_chunk_available(self):
-        buf = ChunkBuffer()
-        buf.push(make_chunk())
-        assert buf.current() is not None
-
-    def test_next_action_consumes_steps(self):
-        buf = ChunkBuffer()
-        buf.push(make_chunk())
-        for i in range(CHUNK_SIZE):
-            action = buf.next_action()
-            assert action is not None
-        assert buf.is_exhausted()
-
-    def test_next_action_returns_none_when_exhausted(self):
-        buf = ChunkBuffer()
-        buf.push(make_chunk())
-        for _ in range(CHUNK_SIZE):
-            buf.next_action()
-        assert buf.next_action() is None
-
-    def test_double_buffer_swap(self):
-        buf = ChunkBuffer()
-        chunk1 = ActionChunk(
-            actions=torch.ones(CHUNK_SIZE, ACTION_DIM, dtype=torch.float16),
-            head_type="flow_matching",
-        )
-        chunk2 = ActionChunk(
-            actions=torch.full((CHUNK_SIZE, ACTION_DIM), 2.0, dtype=torch.float16),
-            head_type="flow_matching",
-        )
-        buf.push(chunk1)
-        buf.push(chunk2)
-        # After second push, active slot should contain chunk2
-        assert buf.current().actions[0, 0].item() == 2.0
-
-    def test_stale_frames_reset_on_push(self):
-        buf = ChunkBuffer(max_stale_frames=10)
-        buf._stale_frames = 5
-        buf.push(make_chunk())
-        assert buf.stale_frames == 0
-
-    def test_mark_stale_increments(self):
-        buf = ChunkBuffer(max_stale_frames=10)
-        buf.mark_stale()
-        assert buf.stale_frames == 1
-
-    def test_mark_stale_raises_on_exceed(self):
-        buf = ChunkBuffer(max_stale_frames=2)
-        buf.mark_stale()
-        buf.mark_stale()
-        with pytest.raises(EmbeddingStaleError):
-            buf.mark_stale()
-
-    @pytest.mark.asyncio
-    async def test_wait_for_chunk_resolves(self):
-        buf = ChunkBuffer()
-
-        async def push_after_delay():
-            await asyncio.sleep(0.05)
-            buf.push(make_chunk())
-
-        task = asyncio.create_task(push_after_delay())
-        arrived = await buf.wait_for_chunk(timeout=1.0)
-        assert arrived
-        await task
-
-    @pytest.mark.asyncio
-    async def test_wait_for_chunk_timeout(self):
-        buf = ChunkBuffer()
-        arrived = await buf.wait_for_chunk(timeout=0.05)
-        assert not arrived
-
-    def test_stats_dict(self):
-        buf = ChunkBuffer(robot_id="r1")
-        stats = buf.stats()
-        assert stats["robot_id"] == "r1"
-        assert not stats["has_chunk"]
-
-
 # ── BudgetManager tests ───────────────────────────────────────────────────────
 
 class TestBudgetManager:
@@ -338,7 +249,9 @@ class TestAsyncScheduler:
         sched = AsyncScheduler(
             vlm_backend=vlm,
             action_head=MockActionHead(),
-            budget_config=BudgetConfig(vlm_budget_ms=0.001),  # ~instant timeout
+            # Room for the mock's 5 ms happy path, far below the 2nd call's hang,
+            # so the first request can bank an embedding for the second to reuse.
+            budget_config=BudgetConfig(vlm_budget_ms=100.0),
             max_stale_frames=5,
         )
         await sched.start()

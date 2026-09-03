@@ -4,11 +4,11 @@ Architecture (from CLAUDE.md):
 
     Thread A — perception (1-5 Hz)    : VLMBackend.encode()
     Thread B — action generation      : ActionHeadRuntime.predict()
-    Thread C — control loop           : reads ActionChunk via ChunkBuffer
+    Thread C — control loop           : pops actions via ChunkBuffer.next_action()
 
 All three stages run concurrently. Stages communicate via:
     - A → B: asyncio.Queue[Embedding]
-    - B → C: ChunkBuffer (double-buffer swap)
+    - B → C: ChunkBuffer (latency-trimmed, blended chunk stitching — ADR-014)
 
 Degradation paths (CLAUDE.md §AsyncScheduler):
     on_vlm_timeout()    : reuse last embedding (stale-frame-limited)
@@ -48,7 +48,7 @@ from vla_runtime.errors import (
 from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.scheduler.budget_manager import BudgetConfig, BudgetManager
-from vla_runtime.scheduler.chunk_buffer import ChunkBuffer
+from vla_runtime.scheduler.chunk_buffer import ChunkBlendPolicy, ChunkBuffer
 from vla_runtime.vlm.base import ActionRequest, Embedding, VLMBackend
 
 _tracer = get_tracer("scheduler")
@@ -62,10 +62,16 @@ class RequestHandle:
     """Opaque handle returned by AsyncScheduler.submit().
 
     Use with scheduler.stream() to consume action chunks.
+
+    Attributes:
+        error: Set when the request failed inside a dispatcher that serves more
+            than one request (FleetScheduler), where raising in place would take
+            down every other robot. stream() re-raises it once the queue drains.
     """
 
     request_id: str
     robot_id: str
+    error: Optional[Exception] = None
     _chunk_queue: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False)
     _done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
@@ -82,6 +88,13 @@ class AsyncScheduler:
         max_stale_frames: Max consecutive frames with reused embedding.
         embedding_queue_maxsize: Backpressure limit on the A→B queue.
         robot_id: Identifier for this robot's pipeline instance.
+        blend_policy: How an incoming chunk merges with the actions still queued
+            (ADR-014). Defaults to the latency-trimmed linear cross-fade.
+        control_rate_hz: Control loop rate, used to convert measured latency into
+            a chunk trim in steps.
+        auto_latency_trim: When True, every completed inference feeds its measured
+            end-to-end latency back into the buffer's trim, so compensation
+            tracks real pipeline behaviour instead of a hardcoded constant.
     """
 
     def __init__(
@@ -92,6 +105,9 @@ class AsyncScheduler:
         max_stale_frames: int = 5,
         embedding_queue_maxsize: int = 2,
         robot_id: str = "robot_0",
+        blend_policy: ChunkBlendPolicy = "linear_overlap",
+        control_rate_hz: float = 50.0,
+        auto_latency_trim: bool = True,
     ) -> None:
         self._vlm = vlm_backend
         self._action_head = action_head
@@ -103,7 +119,10 @@ class AsyncScheduler:
         self._chunk_buffer = ChunkBuffer(
             max_stale_frames=max_stale_frames,
             robot_id=robot_id,
+            blend_policy=blend_policy,
+            control_rate_hz=control_rate_hz,
         )
+        self._auto_latency_trim = auto_latency_trim
 
         # A → B: embedding queue
         self._embedding_queue: asyncio.Queue[Embedding] = asyncio.Queue(
@@ -170,20 +189,37 @@ class AsyncScheduler:
         Args:
             handle: Obtained from submit().
 
+        Chunks already queued are drained before the done flag is consulted:
+        submit() awaits the whole pipeline, so by the time a caller reaches
+        stream() the request is usually already complete with its chunk sitting
+        in the queue. Checking done first would discard it.
+
         Yields:
             ActionChunk objects with actions [chunk_size, action_dim].
         """
-        while not handle._done.is_set():
+        while True:
+            if not handle._chunk_queue.empty():
+                chunk = handle._chunk_queue.get_nowait()
+                if chunk is None:
+                    break
+                yield chunk
+                continue
+
+            if handle._done.is_set():
+                break
+
             try:
                 chunk = await asyncio.wait_for(
                     handle._chunk_queue.get(), timeout=2.0
                 )
-                if chunk is None:
-                    break
-                yield chunk
             except asyncio.TimeoutError:
                 if handle._done.is_set():
                     break
+                continue
+
+            if chunk is None:
+                break
+            yield chunk
 
     # ── Stage A: Perception (VLM encode) ─────────────────────────────────────
 
@@ -203,7 +239,7 @@ class AsyncScheduler:
                     timeout=self._budget._config.vlm_budget_ms / 1000.0,
                 )
                 self._last_embedding = embedding
-                self._chunk_buffer._stale_frames = 0
+                self._chunk_buffer.reset_stale()
 
             except (asyncio.TimeoutError, VLMTimeoutError):
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -221,7 +257,7 @@ class AsyncScheduler:
             span.set_attribute("vlm_latency_ms", round(vlm_ms, 2))
 
         # Stage B: Action head predict
-        await self._run_action_generation(embedding, request, handle)
+        await self._run_action_generation(embedding, request, handle, vlm_ms=vlm_ms)
 
     # ── Stage B: Action generation ────────────────────────────────────────────
 
@@ -230,6 +266,7 @@ class AsyncScheduler:
         embedding: Embedding,
         request: ActionRequest,
         handle: RequestHandle,
+        vlm_ms: float = 0.0,
     ) -> None:
         """Thread B — action head predict with budget tracking."""
         ctx = ErrorContext(
@@ -260,11 +297,16 @@ class AsyncScheduler:
             self._budget.record("action_head", action_ms, request_id=request.request_id)
             span.set_attribute("action_head_latency_ms", round(action_ms, 2))
 
-        # Total pipeline latency
-        total_ms = action_ms  # simplified; real impl tracks from request.timestamp
+        # Total pipeline latency: observation -> chunk available for execution.
+        total_ms = vlm_ms + action_ms
         self._budget.record("total", total_ms, request_id=request.request_id)
 
-        # Push to double buffer (Stage C reads from here)
+        # Feed measured latency back into the chunk trim (ADR-014): the leading
+        # steps of this chunk were predicted total_ms ago and are already stale.
+        if self._auto_latency_trim:
+            self._chunk_buffer.update_latency_trim(total_ms)
+
+        # Integrate into the chunk buffer (Stage C reads from here)
         self._chunk_buffer.push(chunk)
 
         # Also push to per-request stream queue
@@ -275,7 +317,9 @@ class AsyncScheduler:
             "inference_complete",
             request_id=request.request_id,
             action_ms=round(action_ms, 2),
+            total_ms=round(total_ms, 2),
             chunk_size=chunk.chunk_size,
+            latency_trim_steps=self._chunk_buffer.latency_trim_steps,
         )
         _metrics.increment("inference_complete")
 
