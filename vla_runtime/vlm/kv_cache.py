@@ -348,7 +348,7 @@ class KVCacheManager:
         slot.seq_len = pin + new_text_len
         self._eviction_count += num_to_evict
 
-        _metrics.increment("kv_cache_eviction", value=num_to_evict)
+        _metrics.increment("kv_cache_eviction", delta=num_to_evict)
 
     def get(self, request_id: str) -> KVCacheSlot | None:
         """Retrieve the active slot for a request (None if not found)."""
