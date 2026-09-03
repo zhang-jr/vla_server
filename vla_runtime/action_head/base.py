@@ -51,6 +51,23 @@ class RobotState:
     def dof(self) -> int:
         return self.joint_positions.shape[0]
 
+    @property
+    def flat_dim(self) -> int:
+        """Width of as_flat_tensor() — what a head's ``state_dim`` must equal.
+
+        Note this is NOT ``2 * dof``: the gripper occupies its own channel, and
+        ee_pose / extra add more. Deriving it from a RobotState instance is the
+        only safe way to size a head's conditioning input.
+        """
+        width = (
+            self.joint_positions.shape[0]
+            + self.joint_velocities.shape[0]
+            + self.gripper_state.numel()
+        )
+        if self.ee_pose is not None:
+            width += self.ee_pose.numel()
+        return width + sum(v.numel() for v in self.extra.values())
+
     def as_flat_tensor(self) -> torch.Tensor:
         """Concatenate all state tensors into a single flat vector."""
         parts = [self.joint_positions, self.joint_velocities, self.gripper_state.flatten()]
@@ -90,6 +107,51 @@ class ActionChunk:
     def step(self, idx: int) -> torch.Tensor:
         """Return the action for a single control step."""
         return self.actions[idx]
+
+
+# ── Shared conditioning checks ────────────────────────────────────────────────
+
+def check_conditioning_dims(
+    head_type: ActionHeadType,
+    embedding_dim: int,
+    state_dim: int,
+    embedding: "vla_runtime.vlm.base.Embedding",  # noqa: F821
+    robot_state: RobotState,
+) -> None:
+    """Validate that the conditioning inputs match how the head was configured.
+
+    Without this the mismatch surfaces as a bare matmul shape error from inside
+    the conditioning MLP, which says nothing about which input was wrong. The
+    common trap is sizing ``state_dim`` as ``2 * dof`` and forgetting that the
+    gripper occupies its own channel in RobotState.flat_dim.
+
+    Args:
+        head_type: Head paradigm, for the error message.
+        embedding_dim: Embedding width the head was built for.
+        state_dim: Flat state width the head was built for.
+        embedding: The embedding about to be consumed.
+        robot_state: The robot state about to be consumed.
+
+    Raises:
+        ValueError: If either width disagrees with the head's configuration.
+            Callers wrap this in ActionHeadFailureError alongside their own
+            failure handling.
+    """
+    actual_embedding_dim = embedding.data.shape[-1]
+    if actual_embedding_dim != embedding_dim:
+        raise ValueError(
+            f"{head_type} head built for embedding_dim={embedding_dim} but got "
+            f"{actual_embedding_dim}"
+        )
+    if robot_state.flat_dim != state_dim:
+        raise ValueError(
+            f"{head_type} head built for state_dim={state_dim} but RobotState "
+            f"flattens to {robot_state.flat_dim} "
+            f"(dof={robot_state.dof}, gripper={robot_state.gripper_state.numel()}, "
+            f"ee_pose={'yes' if robot_state.ee_pose is not None else 'no'}, "
+            f"extra={sum(v.numel() for v in robot_state.extra.values())}); "
+            f"size state_dim from RobotState.flat_dim, not 2 * dof"
+        )
 
 
 # ── ActionHeadRuntime Protocol ────────────────────────────────────────────────

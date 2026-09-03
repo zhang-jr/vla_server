@@ -32,7 +32,10 @@ from vla_runtime.vlm.base import Embedding
 ACTION_DIM = 7
 CHUNK_SIZE = 8
 EMBEDDING_DIM = 64   # small for fast tests
-STATE_DIM = 14
+DOF = 7
+# A head's state_dim is the FLAT state width, not 2 * dof: the gripper has its
+# own channel. Keep this derived so the two can never drift apart.
+STATE_DIM = DOF * 2 + 1
 
 
 def make_embedding(dim: int = EMBEDDING_DIM) -> Embedding:
@@ -42,7 +45,7 @@ def make_embedding(dim: int = EMBEDDING_DIM) -> Embedding:
     )
 
 
-def make_robot_state(dof: int = STATE_DIM // 2) -> RobotState:
+def make_robot_state(dof: int = DOF) -> RobotState:
     return RobotState(
         joint_positions=torch.zeros(dof),
         joint_velocities=torch.zeros(dof),

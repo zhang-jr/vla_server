@@ -22,7 +22,12 @@ import torch
 import torch.nn as nn
 
 from kernels.flow_matching_step import flow_matching_euler_step, flow_matching_rk4_step
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType, RobotState
+from vla_runtime.action_head.base import (
+    ActionChunk,
+    ActionHeadType,
+    RobotState,
+    check_conditioning_dims,
+)
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding
@@ -167,6 +172,13 @@ class FlowMatchingHead:
 
     def _integrate(self, embedding: Embedding, robot_state: RobotState) -> torch.Tensor:
         """ODE integration: z_0 → z_1 producing [chunk_size, action_dim]."""
+        check_conditioning_dims(
+            "flow_matching",
+            self._embedding_dim,
+            self._state_dim,
+            embedding,
+            robot_state,
+        )
         B = self._chunk_size
 
         # Initial noise z_0 ~ N(0, I) in fp16

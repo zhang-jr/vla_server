@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 
 from kernels.diffusion_step import ddim_step, ddpm_step
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType, RobotState
+from vla_runtime.action_head.base import (
+    ActionChunk,
+    ActionHeadType,
+    RobotState,
+    check_conditioning_dims,
+)
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding
@@ -36,9 +41,18 @@ _tracer = get_tracer("action_head.diffusion")
 SamplerType = Literal["ddpm", "ddim"]
 
 
+# Floor for ᾱ. The cosine schedule evaluates to exactly 0 at t=1, and every
+# sampler divides the residual by sqrt(ᾱ_t) to recover x_0 — at ᾱ_t = 0 that
+# amplification is unbounded and overflows fp16 (max 65504) to inf, which the
+# next step turns into NaN. Clamping ᾱ away from 0 is the same guard the
+# improved-DDPM schedule gets from clipping β to 0.999 (Nichol & Dhariwal 2021).
+_ALPHA_BAR_MIN = 1e-4
+
+
 def _cosine_alpha_bar(t: float, s: float = 0.008) -> float:
-    """Cosine noise schedule: ᾱ_t = cos²(π/2 * (t+s)/(1+s))."""
-    return math.cos(math.pi / 2 * (t + s) / (1 + s)) ** 2
+    """Cosine noise schedule: ᾱ_t = cos²(π/2 * (t+s)/(1+s)), floored at _ALPHA_BAR_MIN."""
+    alpha_bar = math.cos(math.pi / 2 * (t + s) / (1 + s)) ** 2
+    return min(max(alpha_bar, _ALPHA_BAR_MIN), 1.0)
 
 
 def _build_schedule(n_steps: int) -> tuple[list[float], list[float]]:
@@ -189,6 +203,13 @@ class DiffusionHead:
 
     def _denoise(self, embedding: Embedding, robot_state: RobotState) -> torch.Tensor:
         """Reverse diffusion: x_T → x_0."""
+        check_conditioning_dims(
+            "diffusion",
+            self._embedding_dim,
+            self._state_dim,
+            embedding,
+            robot_state,
+        )
         B = self._chunk_size
         x = torch.randn(B, self._action_dim, dtype=torch.float16, device=self._device)
 
