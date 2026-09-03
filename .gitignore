@@ -1,33 +1,39 @@
 # Build artifacts
-  *.egg-info/
-  dist/
-  build/
-  __pycache__/
-  *.pyc
-  *.pyo
-  .eggs/
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
 
-  # IDE / local config
-  .claude/
-  .vscode/
-  .idea/
+# Test / tooling cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
-  # Model weights / data (usually too large for git)
-  *.bin
-  *.safetensors
-  *.gguf
-  *.pt
-  *.pth
-  *.engine   # TensorRT engines
+# IDE / local config
+.claude/
+.vscode/
+.idea/
 
-  # Secrets
-  .env*
-  *.key
-  *.pem
+# Model weights / data (usually too large for git)
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+# TensorRT engines
+*.engine
 
-  # Logs
-  *.log
+# Secrets
+.env*
+*.key
+*.pem
 
-  # Triton / CUDA cache
-  ~/.triton/
-  triton_cache/
+# Logs
+*.log
+
+# Triton / CUDA cache
+.triton/
+triton_cache/
