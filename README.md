@@ -1,34 +1,34 @@
 # VLA Runtime
 
-**模型无关的 VLA Serving Runtime** — 像 vLLM 服务 LLM 一样，统一服务任意 VLA 模型。
+**A model-agnostic serving runtime for Vision-Language-Action models** — serve any VLA model the way vLLM serves LLMs.
 
 ---
 
-## 背景
+## Background
 
-当前 VLA（Vision-Language-Action）部署生态类似 LLM 2022 年（pre-vLLM 时代）：
+VLA deployment today looks a lot like LLM serving in 2022, before vLLM:
 
-- 没有统一推理框架，各团队独立实现相似的模块化异步 pipeline
-- 优化工作分散在学术论文中，缺乏生产级整合
-- vLLM/SGLang 的核心优化（KV cache、continuous batching、PagedAttention）在 VLA 场景大多失效或收益微弱
+- There is no unified inference framework; each team builds its own modular async pipeline, and they all look alike
+- Optimizations are scattered across research papers with no production-grade integration
+- The core optimizations of vLLM/SGLang (KV cache, continuous batching, PagedAttention) mostly fail or yield marginal gains in VLA workloads
 
-本项目填补"vLLM for VLA"的空白，提供可生产部署的 VLA serving runtime。
+This project fills the "vLLM for VLA" gap with a production-deployable VLA serving runtime.
 
 ---
 
-## 核心设计
+## Core Design
 
-### 三线程异步 Pipeline
+### Three-Stage Async Pipeline
 
 ```
-Thread A — perception     1–5 Hz    heavy compute，可云端
-Thread B — action gen     5–20 Hz   中频
-Thread C — control loop   20–100 Hz real-time，必须 edge
+Thread A — perception     1–5 Hz    heavy compute, can run in the cloud
+Thread B — action gen     5–20 Hz   medium frequency
+Thread C — control loop   20–100 Hz real-time, must run on the edge
 ```
 
-三个线程频率与计算密度差异巨大，**异步解耦是核心架构，不是优化项**。同步推理会让机器人 idle，违反 `inference_latency < action_execution_time` 硬约束。
+The three stages differ enormously in frequency and compute density. **Async decoupling is the core architecture, not an optimization.** Synchronous inference leaves the robot idle and violates the hard constraint `inference_latency < action_execution_time`.
 
-### 架构分层
+### Layered Architecture
 
 ```
 Application      ← ActionRequest (image + instruction + robot_state)
@@ -38,66 +38,69 @@ Module           ← VLM Backend  |  Action Head Runtime  |  ROS2 Control
 Infra            ← Triton/CUDA Kernel | Quantization | Observability
 ```
 
-### 与 vLLM 的概念映射
+### Concept Mapping to vLLM
 
-| vLLM | 本项目 | 说明 |
-|------|--------|------|
-| LLM | `VLMBackbone` | 视觉-语言主干，低频 heavy compute |
-| Token Generation | `ActionHead` | 离散 token / flow matching / diffusion |
-| KV Cache | `EmbeddingCache` | 跨帧复用感知 embedding |
-| Continuous Batching | `FleetServing` | 共享 VLM 计算，机器人 state 严格隔离 |
-| API Server | `ActionEndpoint` | REST + WebSocket，`POST /v1/action` |
-| Scheduler | `AsyncScheduler` | 三级 pipeline（perception/action/control） |
+| vLLM | VLA Runtime | Notes |
+|------|-------------|-------|
+| LLM | `VLMBackbone` | Vision-language backbone, low-frequency heavy compute |
+| Token Generation | `ActionHead` | Discrete token / flow matching / diffusion |
+| KV Cache | `EmbeddingCache` | Reuse perception embeddings across frames |
+| Continuous Batching | `FleetServing` | Shared VLM compute, strictly isolated per-robot state |
+| API Server | `ActionEndpoint` | REST + WebSocket, `POST /v1/action` |
+| Scheduler | `AsyncScheduler` | Three-stage pipeline (perception / action / control) |
 
 ---
 
-## 项目结构
+## Project Layout
 
 ```
 vla_runtime/
-├── vlm/                # VLM backbone 后端 (vLLM / SGLang / llama.cpp / LMDeploy)
-├── action_head/        # Action head runtime (discrete_token / flow_matching / diffusion)
-├── scheduler/          # 异步 pipeline (AsyncScheduler / ChunkBuffer / BudgetManager)
-├── control/            # ROS2 集成 (Python bridge + C++ control node)
+├── vlm/                # VLM backbone backends (vLLM / SGLang / llama.cpp / LMDeploy)
+├── action_head/        # Action head runtimes (discrete_token / flow_matching / diffusion)
+├── scheduler/          # Async pipeline (AsyncScheduler / ChunkBuffer / BudgetManager)
+├── control/            # ROS2 integration (Python bridge + C++ control node)
 ├── serving/            # API server + fleet scheduling + edge-cloud router
-├── quantization/       # 量化配置 + 校准 + sim 验证
-├── observability/      # 结构化 tracer + metrics
-└── errors.py           # 异常体系
-kernels/                # Triton / CUDA kernel (flow matching / diffusion / fused attention)
-tests/unit/             # 单元测试
-examples/               # 端到端示例
+├── quantization/       # Quantization config + calibration + sim validation
+├── observability/      # Structured tracer + metrics
+└── errors.py           # Exception hierarchy
+kernels/                # Triton / CUDA kernels (flow matching / diffusion / fused attention)
+tests/unit/             # Unit tests
+examples/               # End-to-end examples
+docs/                   # Subsystem documentation
 ```
+
+See [`docs/`](./docs/README.md) for in-depth documentation of each subsystem.
 
 ---
 
-## 快速开始
+## Quick Start
 
-### 安装
+### Install
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 最小示例（无 GPU）
+### Minimal Example (no GPU)
 
 ```bash
 python examples/openvla_minimal.py
 ```
 
-示例使用 `MockVLMBackend`，无需 GPU 即可运行完整的三阶段 pipeline：量化配置 → VLM encode → action head decode → chunk buffer 消费。
+The example uses a mock VLM backend and runs the full pipeline without a GPU: quantization config → VLM encode → action head decode → chunk buffer consumption.
 
-### 切换真实模型（一行）
+### Switch to a Real Model (one line)
 
 ```python
-# examples/openvla_minimal.py 第 97 行
-# 将 MockOpenVLABackend() 替换为：
+# examples/openvla_minimal.py, line 97
+# Replace MockOpenVLABackend() with:
 from vla_runtime.vlm.vllm_backend import VLLMBackend
 vlm_backend = VLLMBackend(model_path="openvla/openvla-7b")
 ```
 
 ---
 
-## 核心接口
+## Core Interfaces
 
 ### VLMBackend
 
@@ -109,7 +112,7 @@ class VLMBackend(Protocol):
     def latency_budget_ms(self) -> float: ...
 ```
 
-支持后端：`vLLM`、`SGLang`、`LMDeploy`（云端）；`llama.cpp + GGUF`（边缘）。
+Supported backends: `vLLM`, `SGLang`, `LMDeploy` (cloud); `llama.cpp + GGUF` (edge).
 
 ### ActionHeadRuntime
 
@@ -122,7 +125,7 @@ class ActionHeadRuntime(Protocol):
     def frequency_hz(self) -> float: ...
 ```
 
-支持三种范式：离散 token（OpenVLA / RT-2）、flow matching（Pi0 / SmolVLA）、diffusion（Diffusion Policy）。
+Three paradigms are supported: discrete tokens (OpenVLA / RT-2), flow matching (Pi0 / SmolVLA), and diffusion (Diffusion Policy).
 
 ### AsyncScheduler
 
@@ -135,36 +138,36 @@ async for chunk in scheduler.stream(handle):
     robot.execute(chunk)
 ```
 
-内置三个降级钩子：`on_vlm_timeout`（复用上一帧 embedding）、`on_action_head_failure`、`on_budget_exceeded`。
+Three built-in degradation hooks: `on_vlm_timeout` (reuse the previous frame's embedding), `on_action_head_failure`, and `on_budget_exceeded`.
 
 ### QuantizationConfig
 
 ```python
-# 云端激进量化预设
+# Aggressive cloud preset
 cfg = QuantizationConfig.cloud_aggressive()
 # vision_encoder=w4a8, llm_backbone=w4a16, action_head=fp16
 
-# flow matching / diffusion 强制 action_head=fp16，违反抛 PrecisionDegradationError
+# flow matching / diffusion require action_head=fp16; violations raise PrecisionDegradationError
 cfg.validate_for_head_type("flow_matching")
 ```
 
 ---
 
-## 量化策略
+## Quantization Policy
 
-| 组件 | 允许范围 | 禁止 | 原因 |
-|------|---------|------|------|
+| Component | Allowed | Forbidden | Reason |
+|-----------|---------|-----------|--------|
 | Vision Encoder | fp16 / w8a8 / w4a8 | - | - |
 | LLM Backbone | fp16 / w4a16 / w8a16 / gptq / gguf_q4 | - | - |
-| Action Head | **fp16 / w8a16 only** | INT4 / GPTQ | 迭代去噪误差累积，INT4 会导致任务成功率崩塌 |
+| Action Head | **fp16 / w8a16 only** | INT4 / GPTQ | Iterative denoising accumulates error; INT4 collapses task success rate |
 
-验收标准：量化后 sim 端到端任务成功率下降 ≤ 2 pp，不只看 loss。
+Acceptance criterion: end-to-end sim task success rate drops by ≤ 2 pp after quantization — loss alone is not enough.
 
 ---
 
-## 可观测性
+## Observability
 
-每次 inference 产出结构化 trace：
+Every inference emits a structured trace:
 
 ```json
 {
@@ -179,65 +182,103 @@ cfg.validate_for_head_type("flow_matching")
 }
 ```
 
-Phase 3 替换为 OpenTelemetry，对接 Langfuse / Jaeger。
+The JSON tracer will be replaced by OpenTelemetry, exporting to Langfuse / Jaeger.
 
 ---
 
-## 性能目标
+## Performance Targets
 
-| 指标 | Phase 2 中期目标 | Phase 4 最终目标 |
-|------|-----------------|-----------------|
-| 端到端延迟 P50 | ≤ 500 ms | 基线 -10% |
-| 端到端延迟 P95 | ≤ 600 ms | ≤ 550 ms |
-| 吞吐 | ≥ 3 FPS | ≥ 5 FPS |
-| 显存 | ≤ 90% 基线 | ≤ 80% 基线 |
-| 量化后成功率下降 | ≤ 2 pp | ≤ 1 pp |
+| Metric | Mid-term Target | Final Target |
+|--------|-----------------|--------------|
+| End-to-end latency P50 | ≤ 500 ms | Baseline −10% |
+| End-to-end latency P95 | ≤ 600 ms | ≤ 550 ms |
+| Throughput | ≥ 3 FPS | ≥ 5 FPS |
+| GPU memory | ≤ 90% of baseline | ≤ 80% of baseline |
+| Success-rate drop after quantization | ≤ 2 pp | ≤ 1 pp |
 
-参考基线：LiteVLA-Edge 150.5 ms（llama.cpp + GGUF Q4 + ROS2，边缘部署）。
-
----
-
-## 支持的 VLA 模型（规划）
-
-| 模型 | Head 类型 | VLM Backend | 状态 |
-|------|---------|------------|------|
-| OpenVLA-7B | discrete_token | vLLM / SGLang | adapter 完成，待真实 GPU 验证 |
-| SpatialVLA-4B | discrete_token | vLLM | adapter 完成 |
-| SmolVLA / Pi0 | flow_matching | llama.cpp | adapter 完成 |
-| Diffusion Policy | diffusion | - | head 完成 |
+Reference baseline: LiteVLA-Edge at 150.5 ms (llama.cpp + GGUF Q4 + ROS2, edge deployment).
 
 ---
 
-## 技术选型
+## Supported VLA Models (Planned)
 
-| 组件 | 方案 |
-|------|------|
-| 云端 VLM | vLLM / SGLang / LMDeploy |
-| 边缘 VLM | llama.cpp + GGUF |
-| Action Head Kernel | Triton（主）+ TensorRT（fallback） |
-| 序列化 | msgpack（比 JSON 快 2–5x） |
-| 通信 | WebSocket（默认）/ gRPC（enterprise） |
-| 控制集成 | ROS2 Humble+，C++ control node |
-| 量化校准 | LLM-Compressor / TensorRT calibrator |
-| 仿真验证 | LIBERO / RoboCasa |
-| Trace | OpenTelemetry → Langfuse / Jaeger |
-| 测试 | pytest + pytest-benchmark |
+| Model | Head Type | VLM Backend | Status |
+|-------|-----------|-------------|--------|
+| OpenVLA-7B | discrete_token | vLLM / SGLang | Adapter done, pending real-GPU validation |
+| SpatialVLA-4B | discrete_token | vLLM | Adapter done |
+| SmolVLA / Pi0 | flow_matching | llama.cpp | Adapter done |
+| Diffusion Policy | diffusion | - | Head done |
 
 ---
 
-## 关键参考文献
+## Tech Stack
 
-| 文献 | 核心贡献 |
-|------|---------|
-| LiteVLA-Edge (2603.03380) | llama.cpp + ROS2 全链路边缘部署，150.5 ms baseline |
-| VLA-Perf (2602.18397) | VLA 推理性能系统分析，15 条 takeaway |
-| RoboECC (2603.20711) | 自动 edge-cloud 切分点，3.28x 加速 |
-| OpenVLA-OFT (2503.12345) | 双向 attention 并行解码，25–50x |
-| DeeR-VLA (NeurIPS 2024) | 动态早退出机制 |
-| LeRobot (HuggingFace) | PolicyServer + RobotClient async，最接近的现有框架 |
+| Component | Choice |
+|-----------|--------|
+| Cloud VLM | vLLM / SGLang / LMDeploy |
+| Edge VLM | llama.cpp + GGUF |
+| Action Head Kernel | Triton (primary) + TensorRT (fallback) |
+| Serialization | msgpack (2–5x faster than JSON) |
+| Transport | WebSocket (default) / gRPC (enterprise) |
+| Control Integration | ROS2 Humble+, C++ control node |
+| Quantization Calibration | LLM-Compressor / TensorRT calibrator |
+| Sim Validation | LIBERO / RoboCasa |
+| Tracing | OpenTelemetry → Langfuse / Jaeger |
+| Testing | pytest + pytest-benchmark |
+
+---
+
+## TODO
+
+**Baselines & Validation**
+- [ ] GPU server (A100 / H100) and edge device (Jetson Orin) environments
+- [ ] Containerized sim environments (LIBERO + RoboCasa)
+- [ ] Native inference baselines for OpenVLA / SpatialVLA
+- [ ] Reproduce LiteVLA-Edge (target ≈ 150.5 ms)
+- [ ] Unoptimized end-to-end sim task success rate
+- [ ] Sim success rate for every quantization combination
+
+**Performance**
+- [ ] Triton kernel profiling (Nsight Compute)
+- [ ] Triton vs TensorRT vs ONNX Runtime comparison
+- [ ] Resident action head weights + on-demand VLM loading
+- [ ] Hit the latency / throughput / memory targets on real GPUs
+
+**System Integration**
+- [ ] ROS2 integration: Python bridge + C++ control node, rosbag record & replay
+- [ ] Edge-cloud split scheduling over WebSocket + msgpack, with offline fallback
+- [ ] Real-robot robustness: safe takeover ramp, observation freshness, `ObservationStaleError`
+- [ ] API server: `POST /v1/action`, WebSocket streaming, OpenPI wire-schema compatibility
+- [ ] Model hot-swap, Prometheus metrics, health checks
+- [ ] OpenTelemetry tracer
+
+**Model & Embodiment Generalization**
+- [ ] Real-Time Chunking (RTC) support for flow matching heads
+- [ ] Single-arm, bimanual, and mobile manipulation embodiments
+- [ ] Action space abstraction (joint / cartesian / delta) with structured actuator groups
+- [ ] Fleet serving with ≥ 5 independent robots
+
+**Release**
+- [ ] PyPI package
+- [ ] Docker images (server + edge)
+- [ ] HuggingFace Hub integration
+- [ ] Public benchmark suite
+
+---
+
+## Key References
+
+| Reference | Key Contribution |
+|-----------|------------------|
+| [LiteVLA-Edge: Quantized On-Device Multimodal Control for Embedded Robotics](https://arxiv.org/abs/2603.03380) | Full edge deployment with llama.cpp + ROS2, 150.5 ms baseline |
+| [How Fast Can I Run My VLA? Demystifying VLA Inference Performance with VLA-Perf](https://arxiv.org/abs/2602.18397) | Systematic analysis of VLA inference performance, 15 key takeaways |
+| [RoboECC: Multi-Factor-Aware Edge-Cloud Collaborative Deployment for VLA Models](https://arxiv.org/abs/2603.20711) | Automatic edge-cloud split point selection, up to 3.28x speedup |
+| [Fine-Tuning Vision-Language-Action Models: Optimizing Speed and Success (OpenVLA-OFT)](https://arxiv.org/abs/2502.19645) | Parallel decoding with bidirectional attention, 26x action throughput |
+| [DeeR-VLA: Dynamic Inference of Multimodal Large Language Models for Efficient Robot Execution](https://arxiv.org/abs/2411.02359) | Dynamic early-exit mechanism (NeurIPS 2024) |
+| [LeRobot](https://github.com/huggingface/lerobot) | PolicyServer + RobotClient async inference, the closest existing framework |
 
 ---
 
 ## License
 
-待定（计划开源）。
+This project is licensed under the [Apache License 2.0](./LICENSE).
