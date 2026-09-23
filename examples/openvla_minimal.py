@@ -26,8 +26,10 @@ import logging
 import torch
 
 from vla_runtime import configure_logging, get_tracer
+from vla_runtime.action_head.base import RobotState
 from vla_runtime.action_head.discrete_token import DiscreteTokenHead
 from vla_runtime.action_head.flow_matching import FlowMatchingHead
+from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.quantization.config import QuantizationConfig
 from vla_runtime.scheduler.async_scheduler import AsyncScheduler
 from vla_runtime.scheduler.budget_manager import BudgetConfig
@@ -57,7 +59,7 @@ class MockOpenVLABackend:
     def kv_cache_enabled(self) -> bool:
         return True
 
-    async def encode(self, image: torch.Tensor, text: str) -> Embedding:
+    async def encode(self, images, text: str, state=None) -> Embedding:
         # Simulate 50ms VLM encode latency
         await asyncio.sleep(0.05)
         return Embedding(
@@ -65,7 +67,7 @@ class MockOpenVLABackend:
             model_id=self.model_id,
         )
 
-    async def generate(self, image, text):
+    async def generate(self, images, text, state=None):
         n_tokens = 7 * 8   # action_dim * n_dct_coeffs
         yield TokenChunk(token_ids=[128] * n_tokens, is_final=True)
 
@@ -108,29 +110,43 @@ async def main() -> None:
     print(f"\n[ActionHead] Type: {action_head.head_type}, freq={action_head.frequency_hz}Hz")
     print(f"[ActionHead] Chunk size: {action_head.chunk_size}, action dim: {action_head.action_dim}")
 
-    # 3. Create scheduler
+    # 3. Declare what the policy supports (ADR-018). OpenVLA reads no
+    # proprioception and decodes its chunk in one pass, so it runs coupled:
+    # every head call gets a fresh backbone encode.
+    capabilities = PolicyCapabilities(
+        state_placement="none",
+        condition_kind="pooled",
+        head_structure="single_pass",
+    )
+    print(f"[Policy] frequency mode: {capabilities.effective_frequency_mode}")
+
+    # 4. Create scheduler
     scheduler = AsyncScheduler(
         vlm_backend=vlm_backend,
         action_head=action_head,
+        capabilities=capabilities,
         budget_config=BudgetConfig(
             vlm_budget_ms=200.0,
             action_head_budget_ms=50.0,
             total_budget_ms=300.0,
         ),
-        max_stale_frames=5,
         robot_id="franka_panda_0",
     )
 
     await scheduler.start()
     print("\n[Scheduler] Started. Running inference...")
 
-    # 4. Simulate 3 inference cycles
+    # 5. Simulate 3 inference cycles
     for cycle in range(3):
         request = ActionRequest(
             request_id=str(uuid.uuid4())[:8],
-            image=torch.rand(3, 224, 224),
+            images={"base": torch.rand(3, 224, 224)},
             instruction="pick up the red cube and place it in the bin",
-            robot_state=torch.zeros(14),   # 7 joints + 7 velocities
+            robot_state=RobotState(
+                joint_positions=torch.zeros(7),
+                joint_velocities=torch.zeros(7),
+                gripper_state=torch.zeros(1),
+            ),
             frame_id=cycle,
         )
 
@@ -146,7 +162,7 @@ async def main() -> None:
                 f"first_action={chunk.step(0).tolist()[:3]}..."
             )
 
-    # 5. Print stats
+    # 6. Print stats
     stats = scheduler.stats()
     print("\n[Stats] Scheduler snapshot:")
     print(f"  Buffer: {stats['buffer']}")

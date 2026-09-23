@@ -18,6 +18,8 @@ Architecture (simplified):
 
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -26,6 +28,7 @@ from vla_runtime.action_head.base import (
     ActionChunk,
     ActionHeadType,
     RobotState,
+    SharedWeights,
     check_conditioning_dims,
 )
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
@@ -86,6 +89,9 @@ class FlowMatchingHead:
         device: Compute device.
     """
 
+    # The conditioning MLP reads one pooled vector (ADR-019).
+    accepted_condition_kinds: tuple[str, ...] = ("pooled",)
+
     def __init__(
         self,
         action_dim: int = 7,
@@ -104,13 +110,33 @@ class FlowMatchingHead:
         self._n_steps = n_steps
         self._use_rk4 = use_rk4
         self._frequency_hz = frequency_hz
-        self._device = device or torch.device("cpu")
+        device = device or torch.device("cpu")
 
-        self._velocity_net = VelocityMLP(
-            embedding_dim=embedding_dim,
-            state_dim=state_dim,
-            action_dim=action_dim,
-        ).to(dtype=torch.float16, device=self._device)
+        self._weights = SharedWeights(
+            VelocityMLP(
+                embedding_dim=embedding_dim,
+                state_dim=state_dim,
+                action_dim=action_dim,
+            ).to(dtype=torch.float16, device=device),
+            device,
+        )
+
+    @property
+    def _device(self) -> torch.device:
+        return self._weights.device
+
+    @property
+    def _velocity_net(self) -> VelocityMLP:
+        return self._weights.module
+
+    # ── Weight sharing (ADR-012 ③) ────────────────────────────────────────────
+
+    def spawn(self) -> "FlowMatchingHead":
+        """New instance for another robot, sharing these weights."""
+        return copy.copy(self)
+
+    def shares_weights_with(self, other: object) -> bool:
+        return getattr(other, "_weights", None) is self._weights
 
     # ── Protocol properties ───────────────────────────────────────────────────
 
@@ -178,6 +204,7 @@ class FlowMatchingHead:
             self._state_dim,
             embedding,
             robot_state,
+            self.accepted_condition_kinds,
         )
         B = self._chunk_size
 
@@ -210,10 +237,10 @@ class FlowMatchingHead:
         return z  # [chunk_size, action_dim]
 
     def load_weights(self, checkpoint_path: str) -> None:
-        state_dict = torch.load(checkpoint_path, map_location=self._device)
-        self._velocity_net.load_state_dict(state_dict)
+        """Load into the shared weights — applies to every spawned instance."""
+        self._weights.load(checkpoint_path)
         _tracer.event("flow_matching_weights_loaded", path=checkpoint_path)
 
     def to_device(self, device: torch.device) -> None:
-        self._device = device
-        self._velocity_net = self._velocity_net.to(device)
+        """Move the shared weights — applies to every spawned instance."""
+        self._weights.to(device)

@@ -59,7 +59,6 @@ from typing import Literal, Optional
 import torch
 
 from vla_runtime.action_head.base import ActionChunk, ActionHeadType
-from vla_runtime.errors import EmbeddingStaleError, ErrorContext
 from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 
@@ -484,8 +483,6 @@ class ChunkBuffer:
     still queued is decided by ``blend_policy`` (ADR-014).
 
     Args:
-        max_stale_frames: Consecutive frames the embedding may be reused before
-            :meth:`mark_stale` raises EmbeddingStaleError.
         robot_id: Identifier for the robot owning this buffer (tracing).
         blend_policy: How a new chunk merges with the queued tail.
         latency_trim_steps: Initial cap on the leading steps dropped from a new
@@ -504,7 +501,6 @@ class ChunkBuffer:
 
     def __init__(
         self,
-        max_stale_frames: int = 5,
         robot_id: str = "robot_0",
         blend_policy: ChunkBlendPolicy = "linear_overlap",
         latency_trim_steps: int = 0,
@@ -518,7 +514,6 @@ class ChunkBuffer:
                 f"unknown blend_policy {blend_policy!r}; "
                 f"expected one of {sorted(_BLENDERS)}"
             )
-        self._max_stale_frames = max_stale_frames
         self._robot_id = robot_id
         self._blend_policy: ChunkBlendPolicy = blend_policy
         self._latency_trim_steps = max(0, int(latency_trim_steps))
@@ -641,24 +636,14 @@ class ChunkBuffer:
         return steps
 
     def mark_stale(self) -> None:
-        """Count one frame that reused a stale embedding.
+        """Count one frame that fell back to a reused condition.
 
-        Called by AsyncScheduler.on_vlm_timeout() on each fallback frame.
-
-        Raises:
-            EmbeddingStaleError: When stale_frames exceeds max_stale_frames.
+        Observability only: whether a reused condition is still usable is
+        decided by the scheduler from its age against the policy's calibrated
+        tolerance (ADR-018), not from how many frames reused it.
         """
         with self._lock:
             self._stale_frames += 1
-            stale = self._stale_frames
-
-        if stale > self._max_stale_frames:
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="scheduler.chunk_buffer",
-                extra={"robot_id": self._robot_id},
-            )
-            raise EmbeddingStaleError(stale, self._max_stale_frames, ctx)
 
     def reset_stale(self) -> None:
         """Clear the stale-frame counter after a fresh embedding arrives."""

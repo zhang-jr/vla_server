@@ -6,6 +6,7 @@ Tests verify:
   - Per-robot action head isolation (state does not bleed across robots)
   - Priority queue ordering (high-priority requests processed before low)
   - Stale embedding per-robot tracking (not shared across robots)
+  - VLM timeout: coupled policy holds the tail, decoupled reuses within tolerance
   - stats() returns correct per-robot view
   - Graceful shutdown with pending requests
   - EdgeResourceError on queue overflow
@@ -22,31 +23,30 @@ import pytest
 import torch
 
 from vla_runtime.action_head.base import ActionChunk, RobotState
-from vla_runtime.errors import EdgeResourceError
+from vla_runtime.errors import EdgeResourceError, EmbeddingStaleError
 from vla_runtime.serving.fleet import FleetConfig, FleetScheduler
 from vla_runtime.vlm.base import ActionRequest, Embedding
+from tests.unit.factories import coupled_caps, decoupled_caps
+from tests.unit.factories import make_request as _factory_request
+
+# The mock backbone returns a [1, 32] prefix-token condition.
+CAPS = decoupled_caps(condition_kind="prefix_tokens")
 
 
 # ── Test helpers ──────────────────────────────────────────────────────────────
 
 def _make_request(robot_id: str = "robot_0") -> ActionRequest:
-    import time
-    return ActionRequest(
-        image=torch.zeros(3, 224, 224),
-        instruction="test task",
-        robot_state=torch.zeros(14),
-        request_id=str(uuid.uuid4()),
-    )
+    return _factory_request(str(uuid.uuid4()))
 
 
 class _MockVLM:
     latency_budget_ms: float = 200.0
     kv_cache_enabled: bool = False
 
-    async def encode(self, image, text) -> Embedding:
+    async def encode(self, images, text, state=None) -> Embedding:
         return Embedding(data=torch.zeros(1, 32), model_id="mock")
 
-    async def generate(self, image, text):
+    async def generate(self, images, text, state=None):
         raise NotImplementedError
 
     async def warmup(self) -> None:
@@ -84,6 +84,7 @@ def fleet():
     async def _make():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=4, vlm_budget_ms=100.0),
         )
         await f.start()
@@ -124,6 +125,7 @@ def test_max_robots_limit():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=2),
         )
         await f.start()
@@ -163,6 +165,7 @@ def test_action_head_isolation_per_robot():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=4, vlm_budget_ms=100.0),
         )
         await f.start()
@@ -197,6 +200,7 @@ def test_stale_embedding_per_robot_independent():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=4),
         )
         await f.start()
@@ -242,6 +246,7 @@ def test_priority_ordering():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=4),
         )
         await f.start()
@@ -284,6 +289,7 @@ def test_queue_overflow():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=2, vlm_queue_maxsize=2),
         )
         # Don't start dispatch loop — just test queue limit
@@ -297,23 +303,12 @@ def test_queue_overflow():
 
         # Fill the queue to capacity
         for _ in range(2):
-            import uuid
-            req = ActionRequest(
-                image=torch.zeros(3, 224, 224),
-                instruction="task",
-                robot_state=torch.zeros(14),
-                request_id=str(uuid.uuid4()),
-            )
+            req = _make_request()
             await f.submit("robot_0", req)
 
         # Next submit should raise
         with pytest.raises(EdgeResourceError):
-            req = ActionRequest(
-                image=torch.zeros(3, 224, 224),
-                instruction="task",
-                robot_state=torch.zeros(14),
-                request_id=str(uuid.uuid4()),
-            )
+            req = _make_request()
             await f.submit("robot_0", req)
 
     asyncio.get_event_loop().run_until_complete(run())
@@ -341,6 +336,7 @@ def test_stream_produces_chunk():
     async def run():
         f = FleetScheduler(
             vlm_backend=_MockVLM(),
+            capabilities=CAPS,
             config=FleetConfig(max_robots=2, vlm_budget_ms=50.0),
         )
         await f.start()
@@ -375,16 +371,17 @@ def test_one_bad_request_does_not_kill_the_fleet():
         def __init__(self) -> None:
             self.calls = 0
 
-        async def encode(self, image, text) -> Embedding:
+        async def encode(self, images, text, state=None) -> Embedding:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("backend exploded")
-            return await super().encode(image, text)
+            return await super().encode(images, text, state)
 
     async def run():
         vlm = _ExplodingVLM()
         f = FleetScheduler(
             vlm_backend=vlm,
+            capabilities=CAPS,
             config=FleetConfig(max_robots=2, vlm_budget_ms=100.0),
         )
         await f.start()
@@ -414,3 +411,60 @@ def test_one_bad_request_does_not_kill_the_fleet():
         await f.stop()
 
     asyncio.get_event_loop().run_until_complete(run())
+
+
+# ── VLM timeout by frequency mode (ADR-018) ───────────────────────────────────
+
+class _HangOnSecondVLM(_MockVLM):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def encode(self, images, text, state=None) -> Embedding:
+        self.calls += 1
+        if self.calls == 2:
+            await asyncio.sleep(10)
+        return await super().encode(images, text, state)
+
+
+async def _run_two(caps, config: FleetConfig, pause_s: float = 0.0):
+    f = FleetScheduler(vlm_backend=_HangOnSecondVLM(), capabilities=caps, config=config)
+    await f.start()
+    head = _TrackingActionHead("robot_0")
+    await f.register_robot("robot_0", head)
+    first = await f.submit("robot_0", _make_request())
+    first_chunks = [c async for c in f.stream(first)]
+    await asyncio.sleep(pause_s)
+    second = await f.submit("robot_0", _make_request())
+    try:
+        second_chunks = [c async for c in f.stream(second)]
+    finally:
+        await f.stop()
+    return head, first_chunks, second, second_chunks
+
+
+def test_coupled_timeout_holds_tail():
+    head, first, second, chunks = asyncio.get_event_loop().run_until_complete(
+        _run_two(coupled_caps("prefix_tokens"), FleetConfig(vlm_budget_ms=50.0))
+    )
+    assert len(first) == 1
+    assert chunks == []
+    assert second.degraded == "vlm_timeout_hold_tail"
+    assert second.error is None
+    assert head.calls == ["robot_0"], "coupled head must not re-run on the old condition"
+
+
+def test_decoupled_timeout_reuses_condition():
+    head, _, second, chunks = asyncio.get_event_loop().run_until_complete(
+        _run_two(CAPS, FleetConfig(vlm_budget_ms=50.0))
+    )
+    assert len(chunks) == 1
+    assert second.degraded is None
+    assert head.calls == ["robot_0", "robot_0"]
+
+
+def test_decoupled_timeout_past_tolerance_fails_that_request():
+    caps = decoupled_caps(condition_kind="prefix_tokens", max_condition_staleness_ms=1.0)
+    with pytest.raises(EmbeddingStaleError):
+        asyncio.get_event_loop().run_until_complete(
+            _run_two(caps, FleetConfig(vlm_budget_ms=50.0), pause_s=0.01)
+        )

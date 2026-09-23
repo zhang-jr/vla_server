@@ -14,13 +14,14 @@ Quantization: W8A16 is allowed after sim validation. INT4 is forbidden (ADR-003)
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import AsyncIterator
 
 import torch
 import torch.nn as nn
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType, RobotState
+from vla_runtime.action_head.base import ActionChunk, ActionHeadType, RobotState, SharedWeights
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding, TokenChunk
@@ -201,6 +202,9 @@ class DiscreteTokenHead:
         device: Compute device.
     """
 
+    # The OFT decoder reads one pooled vector (ADR-019).
+    accepted_condition_kinds: tuple[str, ...] = ("pooled",)
+
     def __init__(
         self,
         action_dim: int = 7,
@@ -217,7 +221,7 @@ class DiscreteTokenHead:
         self._embedding_dim = embedding_dim
         self._use_oft = use_oft
         self._frequency_hz = frequency_hz
-        self._device = device or torch.device("cpu")
+        device = device or torch.device("cpu")
 
         self._fast = FASTTokenizer(
             action_dim=action_dim,
@@ -226,15 +230,32 @@ class DiscreteTokenHead:
             n_dct_coeffs=n_dct_coeffs,
         )
 
+        oft_decoder = None
         if use_oft:
             n_tokens = action_dim * n_dct_coeffs
-            self._oft_decoder = OFTParallelDecoder(
+            oft_decoder = OFTParallelDecoder(
                 embedding_dim=embedding_dim,
                 n_tokens=n_tokens,
                 vocab_size=vocab_size,
-            ).to(dtype=torch.float16, device=self._device)
-        else:
-            self._oft_decoder = None
+            ).to(dtype=torch.float16, device=device)
+        self._weights = SharedWeights(oft_decoder, device)
+
+    @property
+    def _device(self) -> torch.device:
+        return self._weights.device
+
+    @property
+    def _oft_decoder(self) -> "OFTParallelDecoder | None":
+        return self._weights.module
+
+    # ── Weight sharing (ADR-012 ③) ────────────────────────────────────────────
+
+    def spawn(self) -> "DiscreteTokenHead":
+        """New instance for another robot, sharing these weights."""
+        return copy.copy(self)
+
+    def shares_weights_with(self, other: object) -> bool:
+        return getattr(other, "_weights", None) is self._weights
 
     # ── Protocol properties ───────────────────────────────────────────────────
 
@@ -332,6 +353,11 @@ class DiscreteTokenHead:
 
     def _oft_predict(self, embedding: Embedding) -> torch.Tensor:
         """OFT parallel decode → FAST detokenize → actions [chunk_size, action_dim]."""
+        if embedding.kind not in self.accepted_condition_kinds:
+            raise ValueError(
+                f"discrete_token head reads {list(self.accepted_condition_kinds)} "
+                f"conditions but got {embedding.kind!r}"
+            )
         emb = embedding.data.to(self._device, dtype=torch.float16)
         emb_seq = emb.unsqueeze(0).unsqueeze(0)  # [1, 1, embedding_dim]
 
@@ -341,12 +367,10 @@ class DiscreteTokenHead:
         return self._fast.decode(token_ids)
 
     def load_weights(self, checkpoint_path: str) -> None:
-        if self._oft_decoder is not None:
-            state_dict = torch.load(checkpoint_path, map_location=self._device)
-            self._oft_decoder.load_state_dict(state_dict)
+        """Load into the shared weights — applies to every spawned instance."""
+        self._weights.load(checkpoint_path)
         _tracer.event("discrete_token_weights_loaded", path=checkpoint_path)
 
     def to_device(self, device: torch.device) -> None:
-        self._device = device
-        if self._oft_decoder is not None:
-            self._oft_decoder = self._oft_decoder.to(device)
+        """Move the shared weights — applies to every spawned instance."""
+        self._weights.to(device)

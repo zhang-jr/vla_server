@@ -358,3 +358,23 @@ class TestTensorRTBackend:
             # Should not raise
             backend = TensorRTBackend(head, engine_path="/tmp/test.engine", precision="fp16")
             assert backend.head_type == head.head_type
+
+
+# ── Condition kind acceptance (ADR-019) ───────────────────────────────────────
+
+class TestConditionKindAcceptance:
+    """The built-in MLP heads read a pooled vector only."""
+
+    def test_flow_head_rejects_prefix_tokens(self):
+        head = make_flow_head()
+        emb = Embedding(data=torch.randn(5, EMBEDDING_DIM, dtype=torch.float16))
+        with pytest.raises(ActionHeadFailureError, match="prefix_tokens"):
+            head.predict(emb, make_robot_state())
+
+    def test_flow_head_rejects_per_layer_kv(self):
+        from vla_runtime.vlm.base import LayerKV
+
+        t = torch.zeros(1, 4, 8, dtype=torch.float16)
+        emb = Embedding(kind="per_layer_kv", layer_kv=[LayerKV(key=t, value=t)])
+        with pytest.raises(ActionHeadFailureError, match="per_layer_kv"):
+            make_flow_head().predict(emb, make_robot_state())

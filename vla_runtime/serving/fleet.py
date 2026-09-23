@@ -2,13 +2,23 @@
 
 Architecture (CLAUDE.md ADR-012):
     - One VLM backend instance shared across all robots.
-      Rationale: VLM computation is the bottleneck; sharing amortises cost.
+      Rationale: VLM weights dominate memory; one loaded instance serves the
+      fleet. Forward passes are not shared — each request is encoded on its
+      own, serially, in priority order (no cross-robot batching).
     - Per-robot ActionHeadRuntime instances — internal state (denoising
       trajectory, chunk offset) MUST NOT bleed between robots.
-    - Action head weights are shared across robot instances (memory efficiency),
-      but per-instance runtime state is fully isolated.
+    - Read-only action head weights are shared across those instances
+      (ADR-012 ③): a fleet built with from_policy() spawns each robot's head
+      from the policy's prototype. One instance registered for two robots is
+      refused — it would share state, not just weights.
     - Priority scheduling: safety-critical requests (priority=0) preempt
       lower-priority requests in the VLM queue.
+    - One PolicyCapabilities for the fleet: the shared VLM is one model, so
+      what crosses its boundary and whether heads may re-run on a cached
+      condition is decided once (ADR-018). On a VLM timeout a decoupled
+      policy reuses the robot's last condition within its staleness
+      tolerance; a coupled policy produces no chunk and the robot keeps
+      executing its queued tail.
 
 Priority levels:
     0 — safety-critical (e.g. emergency stop or human proximity avoidance)
@@ -25,6 +35,7 @@ Usage::
 
     fleet = FleetScheduler(
         vlm_backend=vllm_backend,
+        capabilities=caps,
         config=FleetConfig(max_robots=8),
     )
     await fleet.start()
@@ -47,12 +58,14 @@ import heapq
 import itertools
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Optional
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadRuntime, RobotState
+from vla_runtime.action_head.base import ActionChunk, ActionHeadRuntime
+from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import (
     ActionHeadFailureError,
     EdgeResourceError,
+    EmbeddingStaleError,
     ErrorContext,
     VLMTimeoutError,
 )
@@ -61,6 +74,9 @@ from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.scheduler.async_scheduler import RequestHandle
 from vla_runtime.scheduler.budget_manager import BudgetConfig, BudgetManager
 from vla_runtime.vlm.base import ActionRequest, Embedding, VLMBackend
+
+if TYPE_CHECKING:
+    from vla_runtime.policy import Policy
 
 _tracer = get_tracer("serving.fleet")
 _metrics = get_metrics()
@@ -79,7 +95,9 @@ class FleetConfig:
         priority_levels: Number of priority levels (0 = highest).
         vlm_budget_ms: Per-request VLM latency budget.
         action_head_budget_ms: Per-request action head latency budget.
-        max_stale_frames: Max consecutive frames allowed with a stale embedding.
+
+    How long a reused condition stays usable is not configured here: it is the
+    policy's calibrated PolicyCapabilities.max_condition_staleness_ms.
     """
 
     max_robots: int = 8
@@ -87,7 +105,6 @@ class FleetConfig:
     priority_levels: int = 3
     vlm_budget_ms: float = 200.0
     action_head_budget_ms: float = 50.0
-    max_stale_frames: int = 5
 
 
 # ── Robot registration record ─────────────────────────────────────────────────
@@ -101,8 +118,8 @@ class RobotSlot:
         action_head: Independent ActionHeadRuntime instance.
         priority: Default scheduling priority (0 = highest).
         budget_manager: Per-robot budget tracker.
-        last_embedding: Last successfully produced embedding (for stale fallback).
-        stale_frames: Consecutive frames using a stale embedding.
+        last_embedding: Last successfully produced condition (for stale fallback).
+        stale_frames: Consecutive VLM-timeout frames (observability only).
         registered_at: Wall-clock timestamp of registration.
     """
 
@@ -144,15 +161,19 @@ class FleetScheduler:
 
     Args:
         vlm_backend: Shared VLM backend (vLLM, SGLang, llama.cpp, etc.).
+        capabilities: What the served policy supports (ADR-018).
         config: Fleet configuration.
     """
 
     def __init__(
         self,
         vlm_backend: VLMBackend,
+        capabilities: PolicyCapabilities,
         config: FleetConfig | None = None,
     ) -> None:
         self._vlm = vlm_backend
+        self._caps = capabilities
+        self._policy: Optional["Policy"] = None
         self._config = config or FleetConfig()
         self._robots: dict[str, RobotSlot] = {}
         self._lock = asyncio.Lock()
@@ -169,6 +190,25 @@ class FleetScheduler:
         self._dispatch_task: Optional[asyncio.Task] = None
         self._running = False
 
+    @classmethod
+    def from_policy(
+        cls,
+        policy: "Policy",
+        config: FleetConfig | None = None,
+    ) -> "FleetScheduler":
+        """Build a fleet serving one validated Policy.
+
+        Robots registered without an explicit head get one spawned from the
+        policy's prototype: shared weights, private state (ADR-012 ③).
+        """
+        fleet = cls(
+            vlm_backend=policy.vlm_backend,
+            capabilities=policy.capabilities,
+            config=config,
+        )
+        fleet._policy = policy
+        return fleet
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -178,7 +218,12 @@ class FleetScheduler:
         self._dispatch_task = asyncio.create_task(
             self._dispatch_loop(), name="fleet_dispatch"
         )
-        _tracer.event("fleet_started", max_robots=self._config.max_robots)
+        _tracer.event(
+            "fleet_started",
+            max_robots=self._config.max_robots,
+            frequency_mode=self._caps.effective_frequency_mode,
+            staleness_uncalibrated=not self._caps.staleness_calibrated,
+        )
 
     async def stop(self) -> None:
         """Gracefully shut down the fleet dispatcher and VLM backend."""
@@ -198,23 +243,43 @@ class FleetScheduler:
     async def register_robot(
         self,
         robot_id: str,
-        action_head: ActionHeadRuntime,
+        action_head: Optional[ActionHeadRuntime] = None,
         priority: int = 1,
     ) -> None:
         """Register a robot with its dedicated action head instance.
 
         Args:
             robot_id: Unique identifier (e.g. "robot_0", "arm_left").
-            action_head: Independent ActionHeadRuntime for this robot.
-                Must NOT be shared with another registered robot.
+            action_head: This robot's head instance. The instance must not be
+                registered for another robot — it carries per-robot state —
+                though it may share weights with other instances (spawn()).
+                Omit it on a fleet built with from_policy() to spawn one from
+                the policy's prototype.
             priority: Default request priority (0 = highest).
 
         Raises:
-            ValueError: If robot_id is already registered or max_robots exceeded.
+            ValueError: If robot_id is already registered, the head instance
+                is already registered for another robot, or no head was given
+                on a fleet without a policy.
+            EdgeResourceError: If max_robots would be exceeded.
         """
+        if action_head is None:
+            if self._policy is None:
+                raise ValueError(
+                    f"register_robot({robot_id!r}) needs an action_head; only a fleet "
+                    "built with from_policy() can spawn one"
+                )
+            action_head = self._policy.head_for_robot()
         async with self._lock:
             if robot_id in self._robots:
                 raise ValueError(f"Robot '{robot_id}' is already registered")
+            for other in self._robots.values():
+                if other.action_head is action_head:
+                    raise ValueError(
+                        f"this action head instance is already registered for "
+                        f"{other.robot_id!r}; give each robot its own instance "
+                        "(spawn() shares weights without sharing state)"
+                    )
             if len(self._robots) >= self._config.max_robots:
                 raise EdgeResourceError(
                     required_mb=0.0,
@@ -419,28 +484,43 @@ class FleetScheduler:
             priority=item.priority,
         ):
             embedding = await self._vlm_encode(item, slot)
+            if embedding is None:
+                return
             await self._action_generate(embedding, item, slot)
 
     async def _vlm_encode(
         self,
         item: _QueueItem,
         slot: RobotSlot,
-    ) -> Embedding:
-        """Shared VLM encode with timeout and stale-embedding fallback."""
+    ) -> Optional[Embedding]:
+        """Shared VLM encode with timeout fallback.
+
+        Returns:
+            The condition for the head, or None when a coupled policy timed
+            out and the robot should keep executing its queued tail.
+        """
         t0 = time.perf_counter()
         budget_s = self._config.vlm_budget_ms / 1000.0
+        request = item.request
+        state_for_backbone = request.robot_state if self._caps.state_to_backbone else None
+        ctx = ErrorContext(
+            trace_id=_tracer.trace_id,
+            module_name="serving.fleet",
+            request_id=request.request_id,
+        )
 
         try:
-            embedding = await asyncio.wait_for(
-                self._vlm.encode(item.request.image, item.request.instruction),
+            embedding: Optional[Embedding] = await asyncio.wait_for(
+                self._vlm.encode(request.images, request.instruction, state_for_backbone),
                 timeout=budget_s,
             )
+            self._caps.check_condition(embedding, ctx)
             slot.last_embedding = embedding
             slot.stale_frames = 0
 
         except (asyncio.TimeoutError, VLMTimeoutError):
-            embedding = await self._on_vlm_timeout(item, slot)
             _metrics.increment("fleet_vlm_timeout")
+            embedding = await self._on_vlm_timeout(item, slot)
 
         vlm_ms = (time.perf_counter() - t0) * 1000.0
         slot.budget_manager.record("vlm", vlm_ms, request_id=item.request.request_id)
@@ -456,14 +536,19 @@ class FleetScheduler:
         self,
         item: _QueueItem,
         slot: RobotSlot,
-    ) -> Embedding:
-        """Per-robot stale-embedding fallback (mirrors AsyncScheduler logic)."""
+    ) -> Optional[Embedding]:
+        """Per-robot VLM-timeout fallback (mirrors AsyncScheduler logic).
+
+        Raises:
+            VLMTimeoutError: No prior condition for this robot.
+            EmbeddingStaleError: Decoupled policy, last condition too old.
+        """
+        ctx = ErrorContext(
+            trace_id=_tracer.trace_id,
+            module_name="serving.fleet",
+            request_id=item.request.request_id,
+        )
         if slot.last_embedding is None:
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="serving.fleet",
-                request_id=item.request.request_id,
-            )
             raise VLMTimeoutError(
                 timeout_ms=self._config.vlm_budget_ms,
                 budget_ms=self._config.vlm_budget_ms,
@@ -471,23 +556,25 @@ class FleetScheduler:
             )
 
         slot.stale_frames += 1
-        if slot.stale_frames > self._config.max_stale_frames:
-            from vla_runtime.errors import EmbeddingStaleError
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="serving.fleet",
-                request_id=item.request.request_id,
-            )
-            raise EmbeddingStaleError(
+        if self._caps.effective_frequency_mode == "coupled":
+            item.handle.degraded = "vlm_timeout_hold_tail"
+            item.handle._done.set()
+            _tracer.event(
+                "fleet_vlm_timeout_hold_tail",
+                robot_id=item.robot_id,
                 stale_frames=slot.stale_frames,
-                max_stale_frames=self._config.max_stale_frames,
-                context=ctx,
             )
+            return None
+
+        max_age_ms = self._caps.max_condition_staleness_ms
+        if max_age_ms is not None and slot.last_embedding.is_stale(max_age_ms):
+            raise EmbeddingStaleError(slot.last_embedding.age_ms, max_age_ms, ctx)
 
         _tracer.event(
             "fleet_stale_embedding",
             robot_id=item.robot_id,
             stale_frames=slot.stale_frames,
+            embedding_age_ms=round(slot.last_embedding.age_ms, 1),
         )
         return slot.last_embedding
 
@@ -499,15 +586,8 @@ class FleetScheduler:
     ) -> None:
         """Per-robot action head prediction (fully isolated state)."""
         import torch
-        from vla_runtime.action_head.base import RobotState
 
-        robot_state_tensor = item.request.robot_state
-        half = robot_state_tensor.shape[0] // 2
-        robot_state = RobotState(
-            joint_positions=robot_state_tensor[:half],
-            joint_velocities=robot_state_tensor[half:],
-            gripper_state=robot_state_tensor[-1:],
-        )
+        robot_state = item.request.robot_state
 
         t0 = time.perf_counter()
         try:

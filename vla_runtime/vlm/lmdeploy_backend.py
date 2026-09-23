@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import torch
 
+from vla_runtime.action_head.base import RobotState
 from vla_runtime.errors import BackendError, ErrorContext, VLMTimeoutError
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding, TokenChunk, TokenStream
@@ -90,7 +91,12 @@ class LMDeployBackend:
         self._pipeline = None
         _tracer.event("lmdeploy_shutdown", model=self._model_id)
 
-    async def encode(self, image: torch.Tensor, text: str) -> Embedding:
+    async def encode(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> Embedding:
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
             trace_id=_tracer.trace_id,
@@ -101,7 +107,7 @@ class LMDeployBackend:
             self._assert_ready(ctx)
             try:
                 result = await asyncio.wait_for(
-                    self._run_encode(image, text),
+                    self._run_encode(images, text),
                     timeout=self._latency_budget_ms / 1000.0,
                 )
                 span.set_attribute("embedding_dim", result.dim)
@@ -114,7 +120,12 @@ class LMDeployBackend:
                 span.set_error(exc)
                 raise BackendError(f"LMDeploy encode failed: {exc}", ctx) from exc
 
-    async def generate(self, image: torch.Tensor, text: str) -> TokenStream:
+    async def generate(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> TokenStream:
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
             trace_id=_tracer.trace_id,
@@ -122,7 +133,7 @@ class LMDeployBackend:
             request_id=request_id,
         )
         self._assert_ready(ctx)
-        return self._stream_tokens(image, text, ctx)
+        return self._stream_tokens(images, text, ctx)
 
     def _assert_ready(self, ctx: ErrorContext) -> None:
         if self._pipeline is None:
@@ -130,13 +141,13 @@ class LMDeployBackend:
                 "LMDeploy pipeline not initialised — call warmup() first", ctx
             )
 
-    async def _run_encode(self, image: torch.Tensor, text: str) -> Embedding:
+    async def _run_encode(self, images: Mapping[str, torch.Tensor], text: str) -> Embedding:
         # Stub: replace with real LMDeploy multimodal encode call
         hidden_dim = 4096
         dummy = torch.zeros(hidden_dim, dtype=torch.float16)
         return Embedding(data=dummy, model_id=self._model_id)
 
     async def _stream_tokens(
-        self, image: torch.Tensor, text: str, ctx: ErrorContext
+        self, images: Mapping[str, torch.Tensor], text: str, ctx: ErrorContext
     ) -> AsyncIterator[TokenChunk]:
         yield TokenChunk(token_ids=[], is_final=True)

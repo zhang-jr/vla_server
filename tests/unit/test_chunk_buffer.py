@@ -6,7 +6,7 @@ CPU only, no GPU required. Coverage:
 - fully-stale chunk drop (trim >= chunk length)
 - seeding from the robot's measured pose, and easing out of a drained buffer
 - buffer-underrun gaps recorded as intervals
-- stale-embedding accounting and EmbeddingStaleError
+- stale-frame accounting (observability only; staleness is judged by the scheduler)
 - concurrent push / next_action, and the locked-blend fallback under starvation
 """
 
@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from vla_runtime.action_head.base import ActionChunk
-from vla_runtime.errors import EmbeddingStaleError
 from vla_runtime.scheduler.chunk_buffer import (
     _MAX_OPTIMISTIC_RETRIES,
     ChunkBuffer,
@@ -345,25 +344,25 @@ class TestBufferGap:
 
 class TestStaleFrames:
     def test_mark_stale_increments(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         assert buf.stale_frames == 1
 
-    def test_raises_once_the_tolerance_is_exceeded(self):
-        buf = ChunkBuffer(max_stale_frames=2)
-        buf.mark_stale()
-        buf.mark_stale()
-        with pytest.raises(EmbeddingStaleError):
+    def test_counting_never_raises(self):
+        """How long a condition stays usable is the scheduler's call (ADR-018)."""
+        buf = ChunkBuffer()
+        for _ in range(100):
             buf.mark_stale()
+        assert buf.stale_frames == 100
 
     def test_push_resets_the_counter(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         buf.push(make_chunk())
         assert buf.stale_frames == 0
 
     def test_reset_stale_clears_the_counter(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         buf.reset_stale()
         assert buf.stale_frames == 0

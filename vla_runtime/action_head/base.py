@@ -2,7 +2,10 @@
 
 ActionHeadRuntime is intentionally synchronous — frequency guarantees are
 provided by the caller (AsyncScheduler), not by the action head itself.
-Each robot instance gets its own ActionHeadRuntime; they are NOT shared.
+Each robot gets its own ActionHeadRuntime instance, because instances carry
+per-robot state. Instances for different robots can still share one copy of
+the read-only weights: ``spawn()`` returns a new instance bound to the same
+SharedWeights (ADR-012 ③).
 
 Data flow:
     Embedding + RobotState → ActionHeadRuntime.predict() → ActionChunk
@@ -19,10 +22,12 @@ Quantization constraint (ADR-003):
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
+from torch import nn
 
 ActionHeadType = Literal["discrete_token", "flow_matching", "diffusion"]
 
@@ -109,6 +114,57 @@ class ActionChunk:
         return self.actions[idx]
 
 
+# ── Shared weights ────────────────────────────────────────────────────────────
+
+class SharedWeights:
+    """Read-only head weights and their device, shared across robot instances.
+
+    Every head instance spawned from the same original holds a reference to one
+    SharedWeights, so N robots cost one copy of the weights. Operations on it —
+    moving to a device, loading a checkpoint — are group-wide by construction:
+    there is only one tensor to move. Callers must not run them while any
+    sharing instance is serving a predict().
+
+    The module is put in eval mode with gradients disabled: inference must not
+    mutate shared state, and a stray backward pass would.
+
+    Args:
+        module: The head's network, or None for heads without learned weights.
+        device: Device the module lives on.
+    """
+
+    def __init__(self, module: Optional[nn.Module], device: torch.device) -> None:
+        self._module = module
+        self._device = device
+        self._lock = threading.Lock()
+        if module is not None:
+            module.eval()
+            module.requires_grad_(False)
+
+    @property
+    def module(self) -> Optional[nn.Module]:
+        return self._module
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def to(self, device: torch.device) -> None:
+        """Move the shared weights; affects every instance sharing them."""
+        with self._lock:
+            if self._module is not None:
+                self._module = self._module.to(device)
+            self._device = device
+
+    def load(self, checkpoint_path: str) -> None:
+        """Load a checkpoint into the shared weights; affects every sharer."""
+        with self._lock:
+            if self._module is None:
+                return
+            state_dict = torch.load(checkpoint_path, map_location=self._device)
+            self._module.load_state_dict(state_dict)
+
+
 # ── Shared conditioning checks ────────────────────────────────────────────────
 
 def check_conditioning_dims(
@@ -117,6 +173,7 @@ def check_conditioning_dims(
     state_dim: int,
     embedding: "vla_runtime.vlm.base.Embedding",  # noqa: F821
     robot_state: RobotState,
+    accepted_kinds: tuple[str, ...] = ("pooled",),
 ) -> None:
     """Validate that the conditioning inputs match how the head was configured.
 
@@ -131,12 +188,22 @@ def check_conditioning_dims(
         state_dim: Flat state width the head was built for.
         embedding: The embedding about to be consumed.
         robot_state: The robot state about to be consumed.
+        accepted_kinds: Condition kinds this head can read (Embedding.kind).
+            The built-in MLP heads read a pooled vector only; a model whose
+            expert attends over prefix tokens or per-layer K/V needs a head
+            that implements that attention.
 
     Raises:
-        ValueError: If either width disagrees with the head's configuration.
-            Callers wrap this in ActionHeadFailureError alongside their own
-            failure handling.
+        ValueError: If the condition kind is not accepted, or either width
+            disagrees with the head's configuration. Callers wrap this in
+            ActionHeadFailureError alongside their own failure handling.
     """
+    if embedding.kind not in accepted_kinds:
+        raise ValueError(
+            f"{head_type} head reads {list(accepted_kinds)} conditions but got "
+            f"{embedding.kind!r}; check PolicyCapabilities.condition_kind against "
+            f"the head implementation"
+        )
     actual_embedding_dim = embedding.data.shape[-1]
     if actual_embedding_dim != embedding_dim:
         raise ValueError(
@@ -225,4 +292,26 @@ class ActionHeadRuntime(Protocol):
 
     def to_device(self, device: torch.device) -> None:
         """Move weights to the specified device."""
+        ...
+
+
+@runtime_checkable
+class WeightSharingHead(Protocol):
+    """An action head whose instances can share one copy of the weights.
+
+    Implemented by the built-in heads and TensorRTBackend. Kept separate from
+    ActionHeadRuntime so third-party heads without the capability still
+    satisfy the core Protocol.
+    """
+
+    def spawn(self) -> "WeightSharingHead":
+        """New instance for another robot: same weights, fresh per-robot state.
+
+        load_weights() / to_device() on any instance apply to all instances
+        sharing the weights.
+        """
+        ...
+
+    def shares_weights_with(self, other: object) -> bool:
+        """Whether ``other`` reads the same weight tensors as this instance."""
         ...
