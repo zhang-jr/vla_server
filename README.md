@@ -45,7 +45,7 @@ Infra            ← Triton/CUDA Kernel | Quantization | Observability
 | LLM | `VLMBackbone` | Vision-language backbone, low-frequency heavy compute |
 | Token Generation | `ActionHead` | Discrete token / flow matching / diffusion |
 | KV Cache | `EmbeddingCache` | Reuse perception embeddings across frames |
-| Continuous Batching | `FleetServing` | Shared VLM compute, strictly isolated per-robot state |
+| Continuous Batching | `FleetServing` | One shared VLM instance (weights); per-robot forward passes and strictly isolated state |
 | API Server | `ActionEndpoint` | REST + WebSocket, `POST /v1/action` |
 | Scheduler | `AsyncScheduler` | Three-stage pipeline (perception / action / control) |
 
@@ -89,13 +89,14 @@ python examples/openvla_minimal.py
 
 The example uses a mock VLM backend and runs the full pipeline without a GPU: quantization config → VLM encode → action head decode → chunk buffer consumption.
 
-### Switch to a Real Model (one line)
+### Real models and GPU work
 
-```python
-# examples/openvla_minimal.py, line 97
-# Replace MockOpenVLABackend() with:
-from vla_runtime.vlm.vllm_backend import VLLMBackend
-vlm_backend = VLLMBackend(model_path="openvla/openvla-7b")
+No real model runs end to end yet: the vLLM / SGLang / LMDeploy / llama.cpp adapters are stubs that return correctly shaped placeholder tensors.
+
+Tests that need a GPU are marked `@pytest.mark.gpu` and are skipped automatically where no CUDA device is visible. Run them on a CUDA machine with:
+
+```bash
+python -m pytest -m gpu
 ```
 
 ---
@@ -106,13 +107,19 @@ vlm_backend = VLLMBackend(model_path="openvla/openvla-7b")
 
 ```python
 class VLMBackend(Protocol):
-    async def encode(self, image: Tensor, text: str) -> Embedding: ...
-    async def generate(self, image: Tensor, text: str) -> AsyncIterator[TokenChunk]: ...
+    async def encode(
+        self, images: Mapping[str, Tensor], text: str, state: RobotState | None = None,
+    ) -> Embedding: ...
+    async def generate(
+        self, images: Mapping[str, Tensor], text: str, state: RobotState | None = None,
+    ) -> AsyncIterator[TokenChunk]: ...
     @property
     def latency_budget_ms(self) -> float: ...
 ```
 
-Supported backends: `vLLM`, `SGLang`, `LMDeploy` (cloud); `llama.cpp + GGUF` (edge).
+Supported backends: `vLLM`, `SGLang`, `LMDeploy` (cloud); `llama.cpp + GGUF` (edge). The adapters are currently stubs that return correctly shaped placeholder tensors; no real model is wired end to end yet.
+
+`Embedding` is a typed condition — `pooled`, `prefix_tokens`, `per_layer_kv`, or `projected_features` — because what a real action head reads is often per-layer prefix K/V or projected features rather than one vector. `state` reaches the backbone only for policies trained with state in the prefix.
 
 ### ActionHeadRuntime
 
@@ -130,7 +137,17 @@ Three paradigms are supported: discrete tokens (OpenVLA / RT-2), flow matching (
 ### AsyncScheduler
 
 ```python
-scheduler = AsyncScheduler(vlm_backend=..., action_head=..., budget_config=...)
+scheduler = AsyncScheduler(
+    vlm_backend=...,
+    action_head=...,
+    capabilities=PolicyCapabilities(       # declared per model, not guessed (ADR-018)
+        state_placement="suffix",
+        condition_kind="per_layer_kv",
+        head_structure="iterative",
+        max_condition_staleness_ms=300.0,
+    ),
+    budget_config=...,
+)
 await scheduler.start()
 
 handle = await scheduler.submit(request)
@@ -138,14 +155,16 @@ async for chunk in scheduler.stream(handle):
     robot.execute(chunk)
 ```
 
-Three built-in degradation hooks: `on_vlm_timeout` (reuse the previous frame's embedding), `on_action_head_failure`, and `on_budget_exceeded`.
+The policy's capabilities decide its frequency mode. A **decoupled** policy (head consumes fresh state, iterative, staleness calibrated) may re-run its head on the cached condition via `replan()`, and on a backbone timeout reuses the last condition within its tolerance. A **coupled** policy (e.g. state in the backbone prefix) never re-runs the head on an old condition; on a timeout the robot keeps executing the queued chunk tail.
+
+Three built-in degradation hooks: `on_vlm_timeout` (decoupled only — reuse the previous condition within tolerance), `on_action_head_failure`, and `on_budget_exceeded`.
 
 ### QuantizationConfig
 
 ```python
 # Aggressive cloud preset
 cfg = QuantizationConfig.cloud_aggressive()
-# vision_encoder=w4a8, llm_backbone=w4a16, action_head=fp16
+# vision_encoder=w8a8, llm_backbone=w4a16, action_head=fp16
 
 # flow matching / diffusion require action_head=fp16; violations raise PrecisionDegradationError
 cfg.validate_for_head_type("flow_matching")

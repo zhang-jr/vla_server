@@ -28,6 +28,10 @@ class ActionHeadRuntime(Protocol):
 
 Each robot gets its own head instance. State isolation is guaranteed by the caller giving each robot a separate object, not by locking inside the head, which keeps the heads free of synchronization entirely.
 
+Separate instances do not mean separate weights. The built-in heads and `TensorRTBackend` implement `WeightSharingHead`: `spawn()` returns a new instance that reads the same `SharedWeights` — one copy of the network, frozen in eval mode with gradients off. `load_weights()` and `to_device()` act on that shared copy, so they apply to every spawned instance and must not run while any of them is serving. `TensorRTBackend.spawn()` shares the compiled engine but creates a new execution context, since a context holds per-inference state.
+
+A head must be able to read the condition kind its policy declares. The three built-in heads condition an MLP on a pooled vector, so they accept `kind="pooled"` only and reject anything else with a message naming the kind they received. A π0-style expert that attends over per-layer prefix K/V, or a GR00T-style head reading projected features, needs a head that implements that attention — the built-in heads are not stand-ins for it.
+
 `chunk_size` is the main lever on the latency-versus-freshness tradeoff. A larger chunk amortizes per-call overhead and gives the control loop more runway before it can underrun, but it also means actions at the end of the chunk were computed from an older observation.
 
 ## Data types

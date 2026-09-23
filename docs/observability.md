@@ -14,7 +14,7 @@ from vla_runtime import get_tracer
 tracer = get_tracer("scheduler")
 
 with tracer.span("vlm_encode", request_id=rid, model="openvla") as span:
-    embedding = await backend.encode(image, text)
+    embedding = await backend.encode(images, text)
     span.set_attribute("tokens", embedding.dim)
 
 tracer.event("chunk_pushed", robot_id="arm_left", chunk_size=16)
@@ -60,13 +60,15 @@ These are produced without any instrumentation on your part.
 | `action_buffer_gap` | The control loop underruns, and again when it recovers | `state` (`start` / `end`), `duration_ms`, `empty_polls` |
 | `latency_trim_updated` | Measured latency changes the compensation trim | `latency_ms`, `trim_steps` |
 | `chunk_buffer_seeded` | The buffer is anchored to a measured pose | `robot_id` |
-| `vlm_timeout_fallback` | A stale embedding is reused | `stale_frames`, `embedding_age_ms` |
+| `vlm_timeout_fallback` | A decoupled policy reuses its last condition | `stale_frames`, `embedding_age_ms` |
+| `vlm_timeout_hold_tail` / `fleet_vlm_timeout_hold_tail` | A coupled policy's backbone timed out; no chunk, the queued tail keeps running | `stale_frames` |
+| `scheduler_started` / `fleet_started` | A scheduler starts | `frequency_mode`, `staleness_uncalibrated` |
 | `action_head_failure_fallback` | A zero-action chunk is substituted | `error` |
 | `rolling_budget_violation` | Budget violations exceed the tolerated fraction | `latency_ms`, `budget_ms`, `stats` |
 | `inference_complete` | A request finishes | `action_ms`, `total_ms`, `chunk_size`, `latency_trim_steps` |
 | `fleet_request_failed` | One robot's request fails in the shared dispatch loop | `robot_id`, `error_type`, `error` |
 
-Spans cover `perception_encode`, `action_gen_predict`, `flow_matching_predict`, `diffusion_predict`, `discrete_token_predict`, and `fleet_process`.
+Spans cover `perception_encode`, `action_gen_predict`, `scheduler_replan`, `flow_matching_predict`, `diffusion_predict`, `discrete_token_predict`, and `fleet_process`. `perception_encode` carries `frequency_mode`, `condition_kind`, and `condition_bytes` — the last is the per-frame payload an edge-cloud split at the backbone boundary would have to ship.
 
 Two of these deserve attention when reading a trace. `action_buffer_gap` is the one that corresponds directly to physical symptoms — it means the control loop had nothing to execute, which is what a stutter actually is — and it is recorded as an interval rather than a counter because the tail duration is the part that matters. `dropped` on `chunk_pushed` means a chunk arrived so late that the entire thing was already stale, which is a stronger signal than latency percentiles: the pipeline is no longer keeping up at all.
 
@@ -81,7 +83,8 @@ VLARuntimeError
 │   └── ActionHeadFailureError          action head raised
 ├── PipelineError
 │   ├── BudgetExceededError             latency exceeded the configured budget
-│   └── EmbeddingStaleError             too many consecutive frames reused an embedding
+│   ├── EmbeddingStaleError             reused condition older than the policy tolerates
+│   └── PolicyCapabilityError           operation or payload the declared capabilities rule out
 ├── QuantizationError
 │   └── PrecisionDegradationError       precision constraint violated, or success rate dropped
 ├── KernelError                         Triton or TensorRT compilation or launch failure
@@ -90,7 +93,7 @@ VLARuntimeError
     └── NetworkPartitionError           remote backbone unreachable
 ```
 
-Each subclass carries the numbers that describe its own failure. `VLMTimeoutError` holds `timeout_ms` and `budget_ms`; `EmbeddingStaleError` holds the stale frame count and the limit; `PrecisionDegradationError` holds baseline and quantized success rates and the threshold. The message is readable and the fields are machine-readable, so alerting does not have to parse strings.
+Each subclass carries the numbers that describe its own failure. `VLMTimeoutError` holds `timeout_ms` and `budget_ms`; `EmbeddingStaleError` holds the condition's `age_ms` and the `max_age_ms` it exceeded; `PrecisionDegradationError` holds baseline and quantized success rates and the threshold. The message is readable and the fields are machine-readable, so alerting does not have to parse strings.
 
 The types are re-exported at package level:
 
