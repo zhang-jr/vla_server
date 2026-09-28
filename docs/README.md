@@ -42,6 +42,7 @@ Infrastructure  Triton kernels  |  Quantization  |  Observability
 | [Quantization](./quantization.md) | Per-module precision policy, calibration, and task-success-rate validation |
 | [Kernels](./kernels.md) | The Triton kernels, their CPU fallbacks, and autotuning |
 | [Observability](./observability.md) | Structured tracing, metrics, and the error hierarchy |
+| [Benchmark methodology](./benchmark_methodology.md) | Closed-loop LIBERO / ManiSkill benchmarks: execution modes, metrics, and how to run them remotely |
 
 ## Repository map
 
