@@ -297,13 +297,23 @@ async def _async_sim_episode(
     )
     chunk_size = bench.policy.head_prototype.chunk_size
     buffer = _new_buffer(spec, config, record.robot_id)
+    rtc = bench.policy.capabilities.supports_rtc
+    # With an injected latency the delay is known up front; else the buffer estimates it.
+    rtc_delay = (
+        math.ceil(config.latency_ms / 1000.0 * spec.control_hz)
+        if config.latency_ms is not None
+        else None
+    )
     frame = 0
 
     async def infer(obs: Observation) -> tuple[ActionChunk | None, float, str | None]:
         nonlocal frame
         frame += 1
         t0 = time.perf_counter()
-        handle = await scheduler.submit(_request(obs, frame))
+        # The robot executes from this runner's buffer, not the scheduler's,
+        # so the RTC snapshot comes from here, taken with the observation.
+        head_context = buffer.rtc_context(rtc_delay) if rtc else None
+        handle = await scheduler.submit(_request(obs, frame), head_context=head_context)
         chunk = await _drain(scheduler.stream(handle))
         _raise_if_failed(handle)
         return chunk, (time.perf_counter() - t0) * 1000.0, handle.degraded
@@ -386,13 +396,15 @@ async def _realtime_episode(
     buffer = _new_buffer(spec, config, robot_id)
     loop = asyncio.get_running_loop()
     period = 1.0 / spec.control_hz
+    rtc = bench.policy.capabilities.supports_rtc
     frame = 0
 
     async def infer(obs: Observation) -> tuple[ActionChunk | None, float, str | None]:
         nonlocal frame
         frame += 1
         t0 = time.perf_counter()
-        handle = await fleet.submit(robot_id, _request(obs, frame))
+        head_context = buffer.rtc_context() if rtc else None
+        handle = await fleet.submit(robot_id, _request(obs, frame), head_context=head_context)
         chunk = await _drain(fleet.stream(handle))
         _raise_if_failed(handle)
         return chunk, (time.perf_counter() - t0) * 1000.0, handle.degraded

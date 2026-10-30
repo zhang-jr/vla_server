@@ -229,11 +229,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="libero: suite, resolution, num_steps_wait, flip_images, task_ids; "
                              "maniskill: env_ids, control_mode, sim_backend, robot_uids, "
                              "resolution, max_episode_steps, gripper_dofs, state_mode")
-    parser.add_argument("--policy", required=True, choices=("mock", "smolvla"))
+    parser.add_argument("--policy", required=True, choices=("mock", "smolvla", "pi05"))
     parser.add_argument("--policy-opt", action="append", default=[], metavar="KEY=VALUE",
-                        help="smolvla: repo, device, cameras, n_action_steps, vlm_budget_ms; "
+                        help="smolvla: repo, device, cameras, n_action_steps, vlm_budget_ms, vlm, "
+                             "rtc, rtc_beta, rtc_schedule, rtc_jacobian; "
+                             "pi05: same but tokenizer instead of vlm; "
                              "mock: latency_ms, jitter_ms, chunk_size, n_action_steps, n_steps, "
-                             "staleness_ms, embedding_dim")
+                             "staleness_ms, embedding_dim, rtc, rtc_beta, rtc_schedule, rtc_jacobian")
     parser.add_argument("--modes", default="native,sync,async_sim",
                         help=f"comma list of {', '.join(MODES)}, or 'all'")
     parser.add_argument("--blend-policies", default="linear_overlap",

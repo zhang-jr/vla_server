@@ -12,11 +12,27 @@ Capabilities: SmolVLA feeds state into the prefix → ``state_placement="prefix"
 → coupled frequency (ADR-018). The scheduler therefore passes state to
 encode(), and the head never re-runs on a cached condition.
 
+RTC (ADR-015, ``--policy-opt rtc=1``): the expert's Euler loop runs the
+runtime's guidance (``vla_runtime.action_head.rtc``). SmolVLA integrates time
+from 1 (noise) to 0, so each step hands the guidance ``tau = 1 - time`` and the
+sign-flipped velocity. The previous actions arrive in the executed (env) space
+and are normalized with the checkpoint's own action statistics before guiding.
+``benchmarks/benchmark_sim.py`` checks the ``identity`` mode against LeRobot's
+built-in ``RTCProcessor`` with shared noise.
+
+The model-agnostic half — ``PrefixKVBackbone``, ``PrefixKVExpertHead``, the
+``euler_denoise`` loop and ``wrap_prefix_kv_policy`` — is shared with the π0.5
+adapter (``benchmarks/sim/lerobot_pi05.py``); only ``SmolVLAModel`` is SmolVLA-specific.
+
 Built against LeRobot's processor API (``make_pre_post_processors``, 0.4+).
 It relies on these SmolVLA internals, all used verbatim by ``sample_actions``:
 ``prepare_images``, ``prepare_state``, ``model.embed_prefix``,
-``model.vlm_with_expert.forward(fill_kv_cache=True)``, ``model.denoise_step``,
-``model.sample_noise`` and ``make_att_2d_masks``. If a LeRobot upgrade renames
+``model.vlm_with_expert.forward``, ``model.denoise_step``,
+``model.sample_noise`` and ``make_att_2d_masks``. Two prefix-cache layouts are
+handled: LeRobot < 0.6 passes ``fill_kv_cache=True`` and returns a
+``{layer: {"key_states", "value_states"}}`` dict ([B, L, H, D]); 0.6+ fills a
+transformers ``DynamicCache`` ([B, H, L, D]) that ``denoise_step`` appends to
+and crops back in place, so a fresh one is rebuilt for every denoise call. If a LeRobot upgrade renames
 any of them, the alignment test fails loudly rather than the benchmark
 silently measuring a different computation.
 
@@ -27,21 +43,30 @@ Policy options (``--policy-opt key=value``):
                      agentview→observation.images.image, wrist→observation.images.image2)
     n_action_steps   override the checkpoint's value
     vlm_budget_ms    backbone latency budget reported to the scheduler
+    vlm              local SmolVLM2 directory replacing the checkpoint's
+                     ``vlm_model_name`` (backbone config + tokenizer), for
+                     offline hosts, e.g. /models/SmolVLM2-500M-Video-Instruct
+    rtc              1 to declare supports_rtc and guide the expert (default 0)
+    rtc_beta         max guidance weight (default RTCConfig: 5)
+    rtc_schedule     exp / linear / ones / zeros (default exp)
+    rtc_jacobian     vjp / identity (default vjp)
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import Mapping
+import inspect
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
 from benchmarks.sim.envs import EnvSpec, Observation
 from benchmarks.sim.policies import BenchPolicy
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType, RobotState
+from vla_runtime.action_head.base import ActionChunk, ActionHeadContext, ActionHeadType, RobotState
+from vla_runtime.action_head.rtc import RTCConfig, RTCGuidance, guided_velocity, prepare_guidance
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import ActionHeadFailureError, BackendError, ErrorContext
 from vla_runtime.observability.tracer import get_tracer
@@ -84,9 +109,18 @@ class SmolVLAModel:
         repo: Hugging Face repo id or local checkpoint directory.
         device: Where the model runs.
         camera_map: Env camera name → LeRobot image feature key.
+        vlm: Local SmolVLM2 directory replacing the checkpoint's ``vlm_model_name``
+            for both the backbone config and the tokenizer; None keeps the repo id.
     """
 
-    def __init__(self, repo: str, device: torch.device, camera_map: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        repo: str,
+        device: torch.device,
+        camera_map: Mapping[str, str],
+        vlm: str | None = None,
+    ) -> None:
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import make_pre_post_processors
         from lerobot.policies.smolvla.modeling_smolvla import (
             SmolVLAPolicy,
@@ -96,15 +130,25 @@ class SmolVLAModel:
         self.repo = repo
         self.device = device
         self.camera_map = dict(camera_map)
-        self.policy = SmolVLAPolicy.from_pretrained(repo)
+        config = PreTrainedConfig.from_pretrained(repo)
+        pre_overrides: dict[str, dict[str, Any]] = {"device_processor": {"device": str(device)}}
+        if vlm:
+            config.vlm_model_name = vlm
+            pre_overrides["tokenizer_processor"] = {"tokenizer_name": vlm}
+        self.policy = SmolVLAPolicy.from_pretrained(repo, config=config)
         self.policy.to(device)
         self.policy.eval()
+        # Inference only; RTC's VJP must not build graphs for the weights.
+        self.policy.requires_grad_(False)
         self.config = self.policy.config
         self.make_att_2d_masks = make_att_2d_masks
+        self._legacy_cache = "fill_kv_cache" in inspect.signature(
+            self.policy.model.vlm_with_expert.forward
+        ).parameters
         self.pre, self.post = make_pre_post_processors(
             self.policy.config,
             pretrained_path=repo,
-            preprocessor_overrides={"device_processor": {"device": str(device)}},
+            preprocessor_overrides=pre_overrides,
         )
         if not getattr(self.config, "use_cache", True):
             raise ValueError(
@@ -119,8 +163,27 @@ class SmolVLAModel:
             )
 
     @property
+    def model_id(self) -> str:
+        return f"smolvla:{self.repo}"
+
+    @property
+    def num_steps(self) -> int:
+        return int(self.config.num_steps)
+
+    @property
     def action_dim(self) -> int:
         return int(self.config.action_feature.shape[0])
+
+    def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Executed-space actions [n, action_dim] → the model's normalized space.
+
+        Inverse of the postprocessor's unnormalizer, using the same statistics.
+        """
+        for step in getattr(self.post, "steps", ()):
+            if hasattr(step, "_normalize_action"):
+                batch = actions.to(self.device, dtype=torch.float32).unsqueeze(0)
+                return step._normalize_action(batch, inverse=False)[0]
+        raise ValueError(f"{self.repo} postprocessor has no action unnormalizer to invert")
 
     def preprocess(
         self, images: Mapping[str, torch.Tensor], text: str, policy_state: torch.Tensor
@@ -155,56 +218,106 @@ class SmolVLAModel:
         )
         att_2d = self.make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        extra = {"fill_kv_cache": True} if self._legacy_cache else {}
         _, past_key_values = model.vlm_with_expert.forward(
             attention_mask=att_2d,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
-            fill_kv_cache=True,
+            **extra,
         )
         prefix_len = pad_masks.shape[1]
-        layer_indices = sorted(past_key_values)
-        layout = _kv_layout(past_key_values[layer_indices[0]]["key_states"], prefix_len)
+        if self._legacy_cache:
+            layer_indices = sorted(past_key_values)
+            entries = [
+                (past_key_values[i]["key_states"], past_key_values[i]["value_states"])
+                for i in layer_indices
+            ]
+        else:
+            layer_indices = list(range(len(past_key_values.layers)))
+            entries = [(layer.keys, layer.values) for layer in past_key_values.layers]
+        layout = _kv_layout(entries[0][0], prefix_len)
         layers = tuple(
-            LayerKV(
-                key=_heads_first(past_key_values[i]["key_states"], layout),
-                value=_heads_first(past_key_values[i]["value_states"], layout),
-            )
-            for i in layer_indices
+            LayerKV(key=_heads_first(key, layout), value=_heads_first(value, layout))
+            for key, value in entries
         )
         return Embedding(
             kind="per_layer_kv",
             layer_kv=layers,
             attention_mask=pad_masks[0].bool(),
-            model_id=f"smolvla:{self.repo}",
+            model_id=self.model_id,
             metadata={"layer_indices": layer_indices, "kv_layout": layout},
         )
 
-    @torch.inference_mode()
-    def denoise(self, embedding: Embedding, noise: torch.Tensor | None = None) -> torch.Tensor:
-        """Action expert Euler loop over a cached prefix → [chunk_size, action_dim] (CPU)."""
+    def _prefix_cache(self, embedding: Embedding, clone: bool) -> Any:
+        """Rebuild the model's prefix cache from a per_layer_kv condition."""
+        layout = embedding.metadata["kv_layout"]
+        pairs = [
+            (
+                i,
+                _batch_first(kv.key.clone() if clone else kv.key, layout),
+                _batch_first(kv.value.clone() if clone else kv.value, layout),
+            )
+            for i, kv in zip(embedding.metadata["layer_indices"], embedding.layer_kv)
+        ]
+        if self._legacy_cache:
+            return {i: {"key_states": k, "value_states": v} for i, k, v in pairs}
+        from transformers import DynamicCache
+
+        cache = DynamicCache()
+        for i, k, v in pairs:
+            # DynamicCache stores [B, H, L, D].
+            cache.update(_to_bhld(k, layout), _to_bhld(v, layout), i)
+        return cache
+
+    def denoise(
+        self,
+        embedding: Embedding,
+        noise: torch.Tensor | None = None,
+        guidance: RTCGuidance | None = None,
+    ) -> torch.Tensor:
+        """Action expert Euler loop over a cached prefix → [chunk_size, action_dim] (CPU).
+
+        With ``guidance`` (RTC), every step's velocity is guided toward the
+        previous chunk's tail; the ``vjp`` mode needs autograd, so it runs
+        outside inference mode on a copy of the cached K/V.
+        """
+        if guidance is not None and guidance.jacobian == "vjp":
+            with torch.no_grad():
+                return self._denoise(embedding, noise, guidance, detach_cache=True)
+        with torch.inference_mode():
+            return self._denoise(embedding, noise, guidance, detach_cache=False)
+
+    def _denoise(
+        self,
+        embedding: Embedding,
+        noise: torch.Tensor | None,
+        guidance: RTCGuidance | None,
+        detach_cache: bool,
+    ) -> torch.Tensor:
         model = self.policy.model
         config = self.config
-        layout = embedding.metadata["kv_layout"]
-        past_key_values = {
-            i: {
-                "key_states": _batch_first(kv.key, layout),
-                "value_states": _batch_first(kv.value, layout),
-            }
-            for i, kv in zip(embedding.metadata["layer_indices"], embedding.layer_kv)
-        }
+        # Inference-mode tensors cannot enter an autograd graph; copies can.
+        past_key_values = self._prefix_cache(embedding, clone=detach_cache)
         pad_masks = embedding.attention_mask.unsqueeze(0)
+        if detach_cache:
+            pad_masks = pad_masks.clone()
         device = pad_masks.device
         if noise is None:
             noise = model.sample_noise((1, config.chunk_size, config.max_action_dim), device)
-        dt = torch.tensor(-1.0 / config.num_steps, dtype=torch.float32, device=device)
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            v_t = model.denoise_step(pad_masks, past_key_values, x_t, time.expand(1))
-            x_t = x_t + dt * v_t
-            time = time + dt
+        target = None
+        if guidance is not None:
+            # Env space → normalized, zero-padded to the expert's max_action_dim.
+            target = torch.zeros(config.chunk_size, config.max_action_dim, device=device)
+            target[:, : self.action_dim] = self.normalize_actions(guidance.target)
+        x_t = euler_denoise(
+            lambda x, t: model.denoise_step(pad_masks, past_key_values, x, t),
+            noise,
+            config.num_steps,
+            target,
+            guidance,
+        )
         actions = x_t[:, :, : self.action_dim]
         return self._postprocess(actions)
 
@@ -224,6 +337,48 @@ class SmolVLAModel:
     def _postprocess(self, actions: torch.Tensor) -> torch.Tensor:
         out = self.post(actions)
         return out[0].float().cpu()
+
+
+def euler_denoise(
+    velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    noise: torch.Tensor,
+    num_steps: int,
+    target: torch.Tensor | None,
+    guidance: RTCGuidance | None,
+) -> torch.Tensor:
+    """LeRobot / openpi Euler loop from time 1 (noise) to 0, optionally RTC-guided.
+
+    Same schedule as LeRobot's ``euler_integrate``: time is recomputed per
+    step, not accumulated, so a split adapter reproduces it bit for bit.
+
+    Args:
+        velocity_fn: ``(x_t, time[1]) → v_t`` in the model's convention.
+        noise: ``x`` at time 1, ``[1, chunk_size, max_action_dim]``.
+        num_steps: Euler steps.
+        target: Normalized, padded previous actions; required with ``guidance``.
+        guidance: RTC guidance, or None for the plain loop.
+    """
+    device = noise.device
+    dt = -1.0 / num_steps
+    x_t = noise
+    for step in range(num_steps):
+        time = 1.0 + step * dt
+        step_time = torch.tensor(time, dtype=torch.float32, device=device).expand(1)
+        if guidance is None:
+            v_t = velocity_fn(x_t, step_time)
+        else:
+            # Paper convention: tau = 1 - time, velocity points noise → data.
+            v_t = -guided_velocity(
+                lambda x, t=step_time: -velocity_fn(x, t),
+                x_t,
+                1.0 - time,
+                target,
+                guidance.weights,
+                guidance.max_guidance_weight,
+                guidance.jacobian,
+            )
+        x_t = x_t + dt * v_t
+    return x_t
 
 
 def _kv_layout(key: torch.Tensor, prefix_len: int) -> str:
@@ -247,31 +402,78 @@ def _batch_first(t: torch.Tensor, layout: str) -> torch.Tensor:
     return (t.transpose(0, 1) if layout == "BLHD" else t).unsqueeze(0)
 
 
-def _policy_state(state: RobotState | None, context: ErrorContext) -> torch.Tensor:
+def _to_bhld(t: torch.Tensor, layout: str) -> torch.Tensor:
+    """Batch-first cached tensor in ``layout`` → [B, H, L, D]."""
+    return t.transpose(1, 2) if layout == "BLHD" else t
+
+
+class PrefixKVModel(Protocol):
+    """What the generic backbone / head need from a LeRobot prefix-KV adapter.
+
+    Implemented by ``SmolVLAModel`` and ``benchmarks.sim.lerobot_pi05.PI05Model``.
+    """
+
+    repo: str
+    policy: Any
+    config: Any
+
+    @property
+    def model_id(self) -> str: ...
+
+    @property
+    def num_steps(self) -> int: ...
+
+    @property
+    def action_dim(self) -> int: ...
+
+    def encode_prefix(
+        self, images: Mapping[str, torch.Tensor], text: str, policy_state: torch.Tensor
+    ) -> Embedding: ...
+
+    def denoise(
+        self,
+        embedding: Embedding,
+        noise: torch.Tensor | None = None,
+        guidance: RTCGuidance | None = None,
+    ) -> torch.Tensor: ...
+
+    def native_chunk(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        policy_state: torch.Tensor,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor: ...
+
+
+def _policy_state(
+    state: RobotState | None, context: ErrorContext, model_id: str
+) -> torch.Tensor:
     if state is None or "policy_state" not in state.extra:
         raise BackendError(
-            "SmolVLA reads robot state in its prefix but encode() got no "
+            f"{model_id} reads robot state in its prefix but encode() got no "
             "robot_state.extra['policy_state']; the env must provide it",
             context,
         )
     return state.extra["policy_state"]
 
 
-class SmolVLABackbone:
-    """VLMBackend over SmolVLA's VLM: prefix → per-layer K/V.
+class PrefixKVBackbone:
+    """VLMBackend over a LeRobot VLM prefix: images + text + state → per-layer K/V.
 
     GPU work runs on one dedicated thread so the event loop never blocks, and
     concurrent fleet requests are serialized on the shared weights.
     """
 
-    def __init__(self, model: SmolVLAModel, latency_budget_ms: float) -> None:
+    def __init__(self, model: PrefixKVModel, latency_budget_ms: float) -> None:
         self._model = model
         self._budget_ms = latency_budget_ms
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="smolvla-vlm")
+        family = model.model_id.split(":", 1)[0]
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{family}-vlm")
 
     @property
     def model_id(self) -> str:
-        return f"smolvla:{self._model.repo}"
+        return self._model.model_id
 
     @property
     def latency_budget_ms(self) -> float:
@@ -287,8 +489,8 @@ class SmolVLABackbone:
         text: str,
         state: RobotState | None = None,
     ) -> Embedding:
-        context = ErrorContext(trace_id=_tracer.trace_id, module_name="benchmarks.smolvla")
-        policy_state = _policy_state(state, context)
+        context = ErrorContext(trace_id=_tracer.trace_id, module_name="benchmarks.prefix_kv")
+        policy_state = _policy_state(state, context, self.model_id)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor, self._model.encode_prefix, images, text, policy_state
@@ -300,7 +502,7 @@ class SmolVLABackbone:
         text: str,
         state: RobotState | None = None,
     ) -> TokenStream:
-        raise NotImplementedError("SmolVLA has no discrete action tokens")
+        raise NotImplementedError(f"{self.model_id} has no discrete action tokens")
 
     async def warmup(self) -> None:
         pass
@@ -313,20 +515,27 @@ class SmolVLABackbone:
         self._executor.shutdown(wait=True)
 
 
-class SmolVLAExpertHead:
-    """ActionHeadRuntime over SmolVLA's action expert (flow matching, iterative).
+class PrefixKVExpertHead:
+    """ActionHeadRuntime over a LeRobot action expert (flow matching, iterative).
 
     Instances spawned for different robots share the one loaded model; the
     expert keeps no state between calls, so nothing per robot needs copying.
     """
 
     accepted_condition_kinds: tuple[str, ...] = ("per_layer_kv",)
+    supports_rtc: bool = True
 
-    def __init__(self, model: SmolVLAModel, frequency_hz: float = 10.0) -> None:
+    def __init__(
+        self,
+        model: PrefixKVModel,
+        frequency_hz: float = 10.0,
+        rtc_config: RTCConfig | None = None,
+    ) -> None:
         self._model = model
         self._frequency_hz = frequency_hz
+        self._rtc_config = rtc_config or RTCConfig()
 
-    def spawn(self) -> SmolVLAExpertHead:
+    def spawn(self) -> PrefixKVExpertHead:
         return copy.copy(self)
 
     def shares_weights_with(self, other: object) -> bool:
@@ -348,17 +557,30 @@ class SmolVLAExpertHead:
     def action_dim(self) -> int:
         return self._model.action_dim
 
-    def predict(self, embedding: Embedding, robot_state: RobotState) -> ActionChunk:
-        context = ErrorContext(trace_id=_tracer.trace_id, module_name="benchmarks.smolvla.head")
-        try:
-            actions = self._model.denoise(embedding)
-        except Exception as exc:
-            raise ActionHeadFailureError("flow_matching", exc, context) from exc
-        return ActionChunk(
-            actions=actions,
-            head_type="flow_matching",
-            metadata={"n_steps": int(self._model.config.num_steps)},
+    def predict(
+        self,
+        embedding: Embedding,
+        robot_state: RobotState,
+        context: ActionHeadContext | None = None,
+    ) -> ActionChunk:
+        error_context = ErrorContext(
+            trace_id=_tracer.trace_id, module_name="benchmarks.prefix_kv.head"
         )
+        try:
+            guidance = prepare_guidance(
+                context, self.chunk_size, self.action_dim, self._rtc_config
+            )
+            actions = self._model.denoise(embedding, guidance=guidance)
+        except Exception as exc:
+            raise ActionHeadFailureError("flow_matching", exc, error_context) from exc
+        metadata: dict[str, Any] = {
+            "n_steps": self._model.num_steps,
+            "rtc": guidance is not None,
+        }
+        if guidance is not None:
+            metadata["rtc_delay_steps"] = guidance.delay_steps
+            metadata["rtc_overlap_steps"] = guidance.overlap_steps
+        return ActionChunk(actions=actions, head_type="flow_matching", metadata=metadata)
 
     def load_weights(self, checkpoint_path: str) -> None:
         raise NotImplementedError("weights come from the LeRobot checkpoint; rebuild the adapter")
@@ -367,16 +589,20 @@ class SmolVLAExpertHead:
         self._model.policy.to(device)
 
 
-def build_smolvla(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
-    """Load SmolVLA and wrap it as a BenchPolicy (see module docstring for options)."""
-    opts = dict(options)
-    repo = opts.pop("repo", DEFAULT_REPO)
-    device = torch.device(opts.pop("device", "cuda"))
-    cameras = parse_camera_map(opts.pop("cameras")) if "cameras" in opts else dict(LIBERO_CAMERAS)
-    n_action_steps = opts.pop("n_action_steps", None)
-    vlm_budget_ms = float(opts.pop("vlm_budget_ms", "2000"))
-    if opts:
-        raise ValueError(f"unknown --policy-opt for smolvla: {sorted(opts)}")
+def pop_rtc_options(opts: dict[str, str]) -> tuple[bool, RTCConfig]:
+    """Take ``rtc`` / ``rtc_beta`` / ``rtc_schedule`` / ``rtc_jacobian`` out of ``opts``."""
+    rtc = opts.pop("rtc", "0").lower() not in ("0", "false", "no", "")
+    fields: dict[str, Any] = {}
+    if "rtc_beta" in opts:
+        fields["max_guidance_weight"] = float(opts.pop("rtc_beta"))
+    if "rtc_schedule" in opts:
+        fields["prefix_schedule"] = opts.pop("rtc_schedule")
+    if "rtc_jacobian" in opts:
+        fields["jacobian"] = opts.pop("rtc_jacobian")
+    return rtc, RTCConfig(**fields)
+
+
+def check_cameras(cameras: Mapping[str, str], spec: EnvSpec) -> None:
     missing = set(cameras) - set(spec.camera_names)
     if missing:
         raise ValueError(
@@ -384,19 +610,38 @@ def build_smolvla(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
             f"{list(spec.camera_names)}; set --policy-opt cameras=env_cam=lerobot_key,..."
         )
 
-    model = SmolVLAModel(repo, device, cameras)
+
+def wrap_prefix_kv_policy(
+    model: PrefixKVModel,
+    spec: EnvSpec,
+    *,
+    vlm_budget_ms: float,
+    rtc: bool,
+    rtc_config: RTCConfig,
+    n_action_steps: int | None,
+    info: dict[str, Any],
+) -> BenchPolicy:
+    """Prefix-KV model → Policy (prefix state, per_layer_kv, iterative) → BenchPolicy."""
     if model.action_dim != spec.action_dim:
         raise ValueError(
-            f"{repo} outputs {model.action_dim}-D actions but {spec.name} takes {spec.action_dim}-D"
+            f"{model.repo} outputs {model.action_dim}-D actions but {spec.name} takes "
+            f"{spec.action_dim}-D"
         )
-    backbone = SmolVLABackbone(model, latency_budget_ms=vlm_budget_ms)
-    head = SmolVLAExpertHead(model, frequency_hz=spec.control_hz / max(1, int(model.config.n_action_steps)))
+    backbone = PrefixKVBackbone(model, latency_budget_ms=vlm_budget_ms)
+    steps = n_action_steps or int(model.config.n_action_steps)
+    head = PrefixKVExpertHead(
+        model,
+        frequency_hz=spec.control_hz / max(1, steps),
+        rtc_config=rtc_config,
+    )
     caps = PolicyCapabilities(
         state_placement="prefix",
         condition_kind="per_layer_kv",
         head_structure="iterative",
+        supports_rtc=rtc,
     )
-    policy = Policy(name=f"smolvla:{repo}", capabilities=caps, vlm_backend=backbone, head_prototype=head)
+    name = model.model_id + ("+rtc" if rtc else "")
+    policy = Policy(name=name, capabilities=caps, vlm_backend=backbone, head_prototype=head)
 
     async def native(obs: Observation) -> torch.Tensor:
         state = obs["robot_state"].extra["policy_state"]
@@ -410,19 +655,44 @@ def build_smolvla(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    steps = int(n_action_steps) if n_action_steps else int(model.config.n_action_steps)
     return BenchPolicy(
-        name=f"smolvla:{repo}",
+        name=name,
         policy=policy,
         n_action_steps=steps,
         native=native,
         info={
-            "repo": repo,
-            "device": str(device),
+            "repo": model.repo,
             "chunk_size": int(model.config.chunk_size),
             "n_action_steps": steps,
-            "num_denoise_steps": int(model.config.num_steps),
-            "cameras": cameras,
+            "num_denoise_steps": model.num_steps,
+            **info,
+            "rtc": rtc_config.model_dump() if rtc else None,
         },
         close=close,
+    )
+
+
+def build_smolvla(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
+    """Load SmolVLA and wrap it as a BenchPolicy (see module docstring for options)."""
+    opts = dict(options)
+    repo = opts.pop("repo", DEFAULT_REPO)
+    device = torch.device(opts.pop("device", "cuda"))
+    cameras = parse_camera_map(opts.pop("cameras")) if "cameras" in opts else dict(LIBERO_CAMERAS)
+    n_action_steps = opts.pop("n_action_steps", None)
+    vlm_budget_ms = float(opts.pop("vlm_budget_ms", "2000"))
+    vlm = opts.pop("vlm", None)
+    rtc, rtc_config = pop_rtc_options(opts)
+    if opts:
+        raise ValueError(f"unknown --policy-opt for smolvla: {sorted(opts)}")
+    check_cameras(cameras, spec)
+
+    model = SmolVLAModel(repo, device, cameras, vlm=vlm)
+    return wrap_prefix_kv_policy(
+        model,
+        spec,
+        vlm_budget_ms=vlm_budget_ms,
+        rtc=rtc,
+        rtc_config=rtc_config,
+        n_action_steps=int(n_action_steps) if n_action_steps else None,
+        info={"device": str(device), "cameras": cameras},
     )

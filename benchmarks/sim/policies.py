@@ -9,6 +9,7 @@ Registry:
     mock     CPU-only: latency-injecting mock backbone + the built-in
              FlowMatchingHead with random weights. Plumbing checks only.
     smolvla  LeRobot SmolVLA split at the prefix-KV boundary (GPU).
+    pi05     LeRobot π0.5 split at the PaliGemma prefix-KV boundary (GPU).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import torch
 from benchmarks.sim.envs import EnvSpec, Observation
 from vla_runtime.action_head.base import RobotState
 from vla_runtime.action_head.flow_matching import FlowMatchingHead
+from vla_runtime.action_head.rtc import RTCConfig
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.policy import Policy
 from vla_runtime.vlm.base import Embedding, TokenStream
@@ -124,6 +126,14 @@ def _build_mock(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
     chunk_size = int(opts.pop("chunk_size", "16"))
     n_action_steps = int(opts.pop("n_action_steps", str(chunk_size)))
     staleness_ms = opts.pop("staleness_ms", None)
+    rtc = opts.pop("rtc", "0").lower() not in ("0", "false", "no", "")
+    rtc_fields: dict[str, Any] = {}
+    if "rtc_beta" in opts:
+        rtc_fields["max_guidance_weight"] = float(opts.pop("rtc_beta"))
+    if "rtc_schedule" in opts:
+        rtc_fields["prefix_schedule"] = opts.pop("rtc_schedule")
+    if "rtc_jacobian" in opts:
+        rtc_fields["jacobian"] = opts.pop("rtc_jacobian")
     backbone = MockBackbone(
         embedding_dim=embedding_dim,
         latency_ms=float(opts.pop("latency_ms", "0")),
@@ -136,6 +146,7 @@ def _build_mock(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
         embedding_dim=embedding_dim,
         state_dim=spec.state_dim,
         n_steps=int(opts.pop("n_steps", "10")),
+        rtc_config=RTCConfig(**rtc_fields),
     )
     if opts:
         raise ValueError(f"unknown --policy-opt for mock: {sorted(opts)}")
@@ -145,8 +156,10 @@ def _build_mock(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
         condition_kind="pooled",
         head_structure="iterative",
         max_condition_staleness_ms=float(staleness_ms) if staleness_ms else None,
+        supports_rtc=rtc,
     )
-    policy = Policy(name="mock", capabilities=caps, vlm_backend=backbone, head_prototype=head)
+    name = "mock+rtc" if rtc else "mock"
+    policy = Policy(name=name, capabilities=caps, vlm_backend=backbone, head_prototype=head)
     reference_head = head.spawn()
 
     async def native(obs: Observation) -> torch.Tensor:
@@ -155,11 +168,11 @@ def _build_mock(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
         return chunk.actions
 
     return BenchPolicy(
-        name="mock",
+        name=name,
         policy=policy,
         n_action_steps=n_action_steps,
         native=native,
-        info={"embedding_dim": embedding_dim, "chunk_size": chunk_size},
+        info={"embedding_dim": embedding_dim, "chunk_size": chunk_size, "rtc": rtc},
     )
 
 
@@ -169,9 +182,16 @@ def _build_smolvla(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
     return build_smolvla(spec, options)
 
 
+def _build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
+    from benchmarks.sim.lerobot_pi05 import build_pi05
+
+    return build_pi05(spec, options)
+
+
 _REGISTRY: dict[str, Callable[[EnvSpec, dict[str, str]], BenchPolicy]] = {
     "mock": _build_mock,
     "smolvla": _build_smolvla,
+    "pi05": _build_pi05,
 }
 
 
@@ -179,7 +199,7 @@ def make_policy(name: str, spec: EnvSpec, options: dict[str, str]) -> BenchPolic
     """Build a registered policy against an environment spec.
 
     Args:
-        name: Registry key (``mock``, ``smolvla``).
+        name: Registry key (``mock``, ``smolvla``, ``pi05``).
         spec: The environment the policy will act in.
         options: ``--policy-opt key=value`` pairs.
 
