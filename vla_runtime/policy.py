@@ -14,7 +14,8 @@ models.
 What is checked statically here, and what at runtime:
 
 - Here: the head can read the declared condition kind; the head paradigm is
-  consistent with the declared head structure.
+  consistent with the declared head structure; a policy declaring
+  ``supports_rtc`` has a head that implements RealTimeChunkingHead.
 - At runtime (schedulers): each backend output's kind matches the
   declaration — a backend's output kind is not known until it runs.
 """
@@ -23,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from vla_runtime.action_head.base import ActionHeadRuntime, WeightSharingHead
+from vla_runtime.action_head.base import ActionHeadRuntime, WeightSharingHead, head_supports_rtc
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.vlm.base import VLMBackend
 
@@ -57,8 +58,8 @@ class Policy:
 
     Raises:
         PolicyConfigurationError: If the head cannot read the declared
-            condition kind, or its paradigm contradicts the declared head
-            structure.
+            condition kind, its paradigm contradicts the declared head
+            structure, or the policy declares RTC for a head without it.
     """
 
     name: str
@@ -82,6 +83,12 @@ class Policy:
             raise PolicyConfigurationError(
                 f"policy {self.name!r} declares head_structure={caps.head_structure!r} "
                 f"but a {head.head_type} head is {' or '.join(allowed)}"
+            )
+
+        if caps.supports_rtc and not head_supports_rtc(head):
+            raise PolicyConfigurationError(
+                f"policy {self.name!r} declares supports_rtc but {type(head).__name__} "
+                "does not implement RealTimeChunkingHead"
             )
 
     def head_for_robot(self) -> ActionHeadRuntime:

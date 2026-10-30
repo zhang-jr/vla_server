@@ -60,13 +60,19 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncIterator, Optional
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadRuntime
+from vla_runtime.action_head.base import (
+    ActionChunk,
+    ActionHeadContext,
+    ActionHeadRuntime,
+    head_supports_rtc,
+)
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import (
     ActionHeadFailureError,
     EdgeResourceError,
     EmbeddingStaleError,
     ErrorContext,
+    PolicyCapabilityError,
     VLMTimeoutError,
 )
 from vla_runtime.observability.metrics import get_metrics
@@ -152,6 +158,7 @@ class _QueueItem:
     request: ActionRequest = field(compare=False)
     robot_id: str = field(compare=False)
     handle: "RequestHandle" = field(compare=False)
+    head_context: Optional[ActionHeadContext] = field(default=None, compare=False)
 
 
 # ── Fleet scheduler ───────────────────────────────────────────────────────────
@@ -262,6 +269,8 @@ class FleetScheduler:
                 is already registered for another robot, or no head was given
                 on a fleet without a policy.
             EdgeResourceError: If max_robots would be exceeded.
+            PolicyCapabilityError: If the policy declares supports_rtc and the
+                head does not implement RealTimeChunkingHead.
         """
         if action_head is None:
             if self._policy is None:
@@ -270,6 +279,14 @@ class FleetScheduler:
                     "built with from_policy() can spawn one"
                 )
             action_head = self._policy.head_for_robot()
+        if self._caps.supports_rtc and not head_supports_rtc(action_head):
+            raise PolicyCapabilityError(
+                f"capabilities declare supports_rtc but {type(action_head).__name__} "
+                "does not implement RealTimeChunkingHead",
+                ErrorContext(
+                    trace_id=_tracer.trace_id, module_name="serving.fleet", request_id=robot_id
+                ),
+            )
         async with self._lock:
             if robot_id in self._robots:
                 raise ValueError(f"Robot '{robot_id}' is already registered")
@@ -318,13 +335,20 @@ class FleetScheduler:
         robot_id: str,
         request: ActionRequest,
         priority_override: int | None = None,
+        head_context: ActionHeadContext | None = None,
     ) -> RequestHandle:
         """Submit an inference request for a registered robot.
+
+        The fleet keeps no chunk buffer — each robot's client executes its own
+        — so an RTC policy's guidance context comes from the caller, snapshotted
+        when the observation was taken (ADR-015). Without one the head samples
+        unguided.
 
         Args:
             robot_id: Which robot this request belongs to.
             request: ActionRequest with image + instruction + robot_state.
             priority_override: Override the robot's default priority.
+            head_context: RTC context from the robot's chunk buffer.
 
         Returns:
             RequestHandle for streaming results via fleet.stream().
@@ -332,10 +356,21 @@ class FleetScheduler:
         Raises:
             KeyError: If robot_id is not registered.
             EdgeResourceError: If the VLM queue is full (back-pressure).
+            PolicyCapabilityError: If ``head_context`` is given for a policy
+                that does not declare supports_rtc.
         """
         slot = self._robots.get(robot_id)
         if slot is None:
             raise KeyError(f"Robot '{robot_id}' is not registered")
+        if head_context is not None and not self._caps.supports_rtc:
+            raise PolicyCapabilityError(
+                "an RTC head_context was given but the policy does not declare supports_rtc",
+                ErrorContext(
+                    trace_id=_tracer.trace_id,
+                    module_name="serving.fleet",
+                    request_id=request.request_id,
+                ),
+            )
 
         priority = priority_override if priority_override is not None else slot.priority
 
@@ -350,6 +385,7 @@ class FleetScheduler:
             request=request,
             robot_id=robot_id,
             handle=handle,
+            head_context=head_context,
         )
 
         async with self._heap_lock:
@@ -592,10 +628,16 @@ class FleetScheduler:
         t0 = time.perf_counter()
         try:
             loop = asyncio.get_event_loop()
-            chunk = await loop.run_in_executor(
-                None,
-                lambda: slot.action_head.predict(embedding, robot_state),
-            )
+            if self._caps.supports_rtc:
+                chunk = await loop.run_in_executor(
+                    None,
+                    lambda: slot.action_head.predict(embedding, robot_state, item.head_context),
+                )
+            else:
+                chunk = await loop.run_in_executor(
+                    None,
+                    lambda: slot.action_head.predict(embedding, robot_state),
+                )
         except ActionHeadFailureError as exc:
             _tracer.event(
                 "fleet_action_head_failure",

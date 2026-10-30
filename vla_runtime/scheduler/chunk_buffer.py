@@ -33,6 +33,13 @@ ADR-014 replaces the wholesale swap with four pluggable blend policies:
 ``strategy/action_buffer.py`` (Apache-2.0, arXiv:2607.02646), which validated
 them on eight real robots; ``ensemble`` follows ACT (arXiv:2304.13705).
 
+For RTC-capable heads (ADR-015) the buffer is also the source of the guidance
+context: :meth:`ChunkBuffer.rtc_context` snapshots the queued actions and the
+expected inference delay when an observation is taken. RTC removes the
+discontinuity at its source; the blend policy still applies on push, and
+``trim`` is the natural partner since the guided chunk already continues the
+old one.
+
 ``latency_trim_steps`` is never hardcoded: :meth:`ChunkBuffer.update_latency_trim`
 derives it from the measured end-to-end latency times the control rate, so the
 trim tracks the pipeline's actual behaviour (CLAUDE.md forbids hardcoded timeout
@@ -58,7 +65,7 @@ from typing import Literal, Optional
 
 import torch
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType
+from vla_runtime.action_head.base import ActionChunk, ActionHeadContext, ActionHeadType
 from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 
@@ -517,6 +524,9 @@ class ChunkBuffer:
         self._robot_id = robot_id
         self._blend_policy: ChunkBlendPolicy = blend_policy
         self._latency_trim_steps = max(0, int(latency_trim_steps))
+        # Unclamped steps-in-flight estimate; RTC's delay must not inherit the
+        # trim ceiling, which exists to protect the blend, not the guidance.
+        self._estimated_delay_steps = self._latency_trim_steps
         self._max_latency_trim_steps = max(0, int(max_latency_trim_steps))
         self._control_rate_hz = max(1.0, float(control_rate_hz))
 
@@ -621,11 +631,12 @@ class ChunkBuffer:
         Returns:
             The trim now in effect, in control steps.
         """
-        steps = int(math.ceil(max(0.0, latency_ms) / 1000.0 * self._control_rate_hz))
-        steps = min(steps, self._max_latency_trim_steps)
+        estimated = int(math.ceil(max(0.0, latency_ms) / 1000.0 * self._control_rate_hz))
+        steps = min(estimated, self._max_latency_trim_steps)
         with self._lock:
             changed = steps != self._latency_trim_steps
             self._latency_trim_steps = steps
+            self._estimated_delay_steps = estimated
         if changed:
             _tracer.event(
                 "latency_trim_updated",
@@ -634,6 +645,27 @@ class ChunkBuffer:
                 trim_steps=steps,
             )
         return steps
+
+    def rtc_context(self, delay_steps: Optional[int] = None) -> ActionHeadContext:
+        """Snapshot for RTC guidance, taken when the observation is captured.
+
+        Row 0 of ``prev_actions`` is the action the control loop emits next,
+        which is also step 0 of the chunk predicted from this observation.
+
+        Args:
+            delay_steps: Expected steps until the new chunk lands. Defaults to
+                the estimate from the last :meth:`update_latency_trim`, without
+                the trim ceiling.
+
+        Returns:
+            Context with ``prev_actions`` None when nothing is queued.
+        """
+        queued = self._blender.peek()
+        if delay_steps is None:
+            with self._lock:
+                delay_steps = self._estimated_delay_steps
+        prev = None if queued is None or queued.shape[0] == 0 else queued.detach().clone()
+        return ActionHeadContext(prev_actions=prev, inference_delay_steps=max(0, int(delay_steps)))
 
     def mark_stale(self) -> None:
         """Count one frame that fell back to a reused condition.
@@ -784,6 +816,7 @@ class ChunkBuffer:
                 "has_chunk": remaining > 0,
                 "remaining": remaining,
                 "latency_trim_steps": self._latency_trim_steps,
+                "estimated_delay_steps": self._estimated_delay_steps,
                 "consumed_since_push": consumed,
                 "stale_frames": self._stale_frames,
                 "total_frames": self._total_frames,

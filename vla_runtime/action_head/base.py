@@ -114,6 +114,28 @@ class ActionChunk:
         return self.actions[idx]
 
 
+@dataclass
+class ActionHeadContext:
+    """What the caller knows about the chunk being replaced (ADR-015, RTC).
+
+    Captured when the observation is taken, so row 0 of ``prev_actions`` and
+    step 0 of the chunk about to be predicted refer to the same control step.
+
+    Attributes:
+        prev_actions: [n, action_dim] actions still queued for execution, in
+            the executed-action space (what the control loop sends). None at
+            episode start or when the buffer has drained.
+        inference_delay_steps: Control steps expected to elapse before the new
+            chunk is available; that many leading steps execute from
+            ``prev_actions`` regardless and are frozen during denoising.
+        extra: Head-specific extras.
+    """
+
+    prev_actions: torch.Tensor | None = None
+    inference_delay_steps: int = 0
+    extra: dict = field(default_factory=dict)
+
+
 # ── Shared weights ────────────────────────────────────────────────────────────
 
 class SharedWeights:
@@ -315,3 +337,36 @@ class WeightSharingHead(Protocol):
     def shares_weights_with(self, other: object) -> bool:
         """Whether ``other`` reads the same weight tensors as this instance."""
         ...
+
+
+@runtime_checkable
+class RealTimeChunkingHead(Protocol):
+    """An iterative head that can condition denoising on the previous chunk (ADR-015).
+
+    Kept separate from ActionHeadRuntime, like WeightSharingHead, so heads
+    without RTC still satisfy the core Protocol. Schedulers pass a context
+    only when the policy declares ``supports_rtc`` and the head implements
+    this Protocol; ``predict(embedding, robot_state)`` keeps working
+    unchanged and samples unguided.
+    """
+
+    supports_rtc: bool
+
+    def predict(
+        self,
+        embedding: "vla_runtime.vlm.base.Embedding",  # noqa: F821
+        robot_state: RobotState,
+        context: Optional[ActionHeadContext] = None,
+    ) -> ActionChunk:
+        """Predict a chunk; with a context, guided to continue ``prev_actions``.
+
+        Raises:
+            ActionHeadFailureError: On any unrecoverable prediction error,
+                including a context whose shape does not match the head.
+        """
+        ...
+
+
+def head_supports_rtc(head: object) -> bool:
+    """Whether ``head`` can consume an ActionHeadContext."""
+    return isinstance(head, RealTimeChunkingHead) and bool(getattr(head, "supports_rtc", False))

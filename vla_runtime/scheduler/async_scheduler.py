@@ -52,7 +52,13 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadRuntime, RobotState
+from vla_runtime.action_head.base import (
+    ActionChunk,
+    ActionHeadContext,
+    ActionHeadRuntime,
+    RobotState,
+    head_supports_rtc,
+)
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import (
     ActionHeadFailureError,
@@ -141,6 +147,14 @@ class AsyncScheduler:
         self._action_head = action_head
         self._caps = capabilities
         self._robot_id = robot_id
+        if capabilities.supports_rtc and not head_supports_rtc(action_head):
+            raise PolicyCapabilityError(
+                f"capabilities declare supports_rtc but {type(action_head).__name__} "
+                "does not implement RealTimeChunkingHead",
+                ErrorContext(trace_id=_tracer.trace_id, module_name="scheduler.async"),
+            )
+        # RTC contexts captured at submit time, consumed by action generation.
+        self._head_contexts: dict[str, ActionHeadContext] = {}
         self._budget = BudgetManager(
             config=budget_config or BudgetConfig(),
             on_budget_exceeded=self._on_budget_exceeded_sync,
@@ -218,24 +232,43 @@ class AsyncScheduler:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def submit(self, request: ActionRequest) -> RequestHandle:
+    async def submit(
+        self,
+        request: ActionRequest,
+        head_context: Optional[ActionHeadContext] = None,
+    ) -> RequestHandle:
         """Submit an ActionRequest to the pipeline.
+
+        For an RTC policy the guidance context is snapshotted here, when the
+        observation is taken, from this scheduler's chunk buffer. A caller
+        that executes actions from its own buffer passes ``head_context``
+        instead (ADR-015).
 
         Args:
             request: The inference request with image, instruction, robot_state.
+            head_context: RTC context overriding the internal snapshot.
 
         Returns:
             RequestHandle for streaming results via scheduler.stream().
+
+        Raises:
+            PolicyCapabilityError: If ``head_context`` is given for a policy
+                that does not declare ``supports_rtc``.
         """
+        self._capture_head_context(request.request_id, head_context)
         handle = RequestHandle(
             request_id=request.request_id,
             robot_id=self._robot_id,
         )
         self._active_handles[request.request_id] = handle
 
-        with _tracer.span("scheduler_submit", request_id=request.request_id):
-            # Stage A: VLM encode (may be awaited or run in background)
-            await self._run_perception(request, handle)
+        try:
+            with _tracer.span("scheduler_submit", request_id=request.request_id):
+                # Stage A: VLM encode (may be awaited or run in background)
+                await self._run_perception(request, handle)
+        finally:
+            # Paths that never reach the head (coupled timeout hold) leave one behind.
+            self._head_contexts.pop(request.request_id, None)
 
         return handle
 
@@ -282,6 +315,7 @@ class AsyncScheduler:
             raise PipelineError("replan() before any condition was produced", ctx)
         self._check_condition_fresh(self._last_embedding, ctx)
 
+        self._capture_head_context(request_id, None)
         handle = RequestHandle(request_id=request_id, robot_id=self._robot_id)
         self._active_handles[request_id] = handle
         with _tracer.span(
@@ -425,6 +459,24 @@ class AsyncScheduler:
 
     # ── Stage B: Action generation ────────────────────────────────────────────
 
+    def _capture_head_context(
+        self, request_id: str, head_context: Optional[ActionHeadContext]
+    ) -> None:
+        if not self._caps.supports_rtc:
+            if head_context is not None:
+                raise PolicyCapabilityError(
+                    "an RTC head_context was given but the policy does not declare supports_rtc",
+                    ErrorContext(
+                        trace_id=_tracer.trace_id,
+                        module_name="scheduler.submit",
+                        request_id=request_id,
+                    ),
+                )
+            return
+        self._head_contexts[request_id] = (
+            head_context if head_context is not None else self._chunk_buffer.rtc_context()
+        )
+
     async def _run_action_generation(
         self,
         embedding: Embedding,
@@ -439,10 +491,17 @@ class AsyncScheduler:
             try:
                 # predict() is sync — run in executor to not block event loop
                 loop = asyncio.get_event_loop()
-                chunk = await loop.run_in_executor(
-                    None,
-                    lambda: self._action_head.predict(embedding, robot_state),
-                )
+                head_context = self._head_contexts.pop(request_id, None)
+                if self._caps.supports_rtc:
+                    chunk = await loop.run_in_executor(
+                        None,
+                        lambda: self._action_head.predict(embedding, robot_state, head_context),
+                    )
+                else:
+                    chunk = await loop.run_in_executor(
+                        None,
+                        lambda: self._action_head.predict(embedding, robot_state),
+                    )
             except ActionHeadFailureError as exc:
                 span.set_error(exc)
                 chunk = await self.on_action_head_failure(request_id, exc)

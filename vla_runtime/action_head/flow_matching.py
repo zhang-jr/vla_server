@@ -26,11 +26,13 @@ import torch.nn as nn
 from kernels.flow_matching_step import flow_matching_euler_step, flow_matching_rk4_step
 from vla_runtime.action_head.base import (
     ActionChunk,
+    ActionHeadContext,
     ActionHeadType,
     RobotState,
     SharedWeights,
     check_conditioning_dims,
 )
+from vla_runtime.action_head.rtc import RTCConfig, RTCGuidance, guided_velocity, prepare_guidance
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding
@@ -87,10 +89,14 @@ class FlowMatchingHead:
         use_rk4: Use RK4 instead of Euler (4x cost, higher accuracy).
         frequency_hz: Target inference frequency (used by scheduler).
         device: Compute device.
+        rtc_config: Guidance parameters used when predict() gets an RTC
+            context (ADR-015); defaults to RTCConfig().
     """
 
     # The conditioning MLP reads one pooled vector (ADR-019).
     accepted_condition_kinds: tuple[str, ...] = ("pooled",)
+    # The velocity net is differentiable in its input, so RTC guidance applies.
+    supports_rtc: bool = True
 
     def __init__(
         self,
@@ -102,7 +108,9 @@ class FlowMatchingHead:
         use_rk4: bool = False,
         frequency_hz: float = 10.0,
         device: torch.device | None = None,
+        rtc_config: RTCConfig | None = None,
     ) -> None:
+        self._rtc_config = rtc_config or RTCConfig()
         self._action_dim = action_dim
         self._chunk_size = chunk_size
         self._embedding_dim = embedding_dim
@@ -158,15 +166,23 @@ class FlowMatchingHead:
 
     # ── Core interface ────────────────────────────────────────────────────────
 
-    def predict(self, embedding: Embedding, robot_state: RobotState) -> ActionChunk:
+    def predict(
+        self,
+        embedding: Embedding,
+        robot_state: RobotState,
+        context: ActionHeadContext | None = None,
+    ) -> ActionChunk:
         """Predict action chunk via flow matching integration.
 
         Runs the ODE integration from z_0~N(0,I) to z_1 using the velocity
-        network conditioned on the shared embedding and robot state.
+        network conditioned on the shared embedding and robot state. With an
+        RTC context carrying previous actions, every velocity evaluation is
+        guided toward them (ADR-015).
 
         Args:
             embedding: VLM embedding [embedding_dim].
             robot_state: Current robot state.
+            context: Optional RTC context from the scheduler.
 
         Returns:
             ActionChunk with actions [chunk_size, action_dim].
@@ -179,16 +195,25 @@ class FlowMatchingHead:
 
         with _tracer.span("flow_matching_predict", n_steps=self._n_steps) as span:
             try:
-                actions = self._integrate(embedding, robot_state)
+                guidance = prepare_guidance(
+                    context, self._chunk_size, self._action_dim, self._rtc_config
+                )
+                actions = self._integrate(embedding, robot_state, guidance)
                 span.set_attribute("chunk_size", self._chunk_size)
                 span.set_attribute("integration", "rk4" if self._use_rk4 else "euler")
+                span.set_attribute("rtc", guidance is not None)
+                metadata = {
+                    "n_steps": self._n_steps,
+                    "integrator": "rk4" if self._use_rk4 else "euler",
+                    "rtc": guidance is not None,
+                }
+                if guidance is not None:
+                    metadata["rtc_delay_steps"] = guidance.delay_steps
+                    metadata["rtc_overlap_steps"] = guidance.overlap_steps
                 return ActionChunk(
                     actions=actions,
                     head_type="flow_matching",
-                    metadata={
-                        "n_steps": self._n_steps,
-                        "integrator": "rk4" if self._use_rk4 else "euler",
-                    },
+                    metadata=metadata,
                 )
             except Exception as exc:
                 span.set_error(exc)
@@ -196,7 +221,12 @@ class FlowMatchingHead:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _integrate(self, embedding: Embedding, robot_state: RobotState) -> torch.Tensor:
+    def _integrate(
+        self,
+        embedding: Embedding,
+        robot_state: RobotState,
+        guidance: RTCGuidance | None = None,
+    ) -> torch.Tensor:
         """ODE integration: z_0 → z_1 producing [chunk_size, action_dim]."""
         check_conditioning_dims(
             "flow_matching",
@@ -222,17 +252,35 @@ class FlowMatchingHead:
         dt = 1.0 / self._n_steps
         times = [i * dt for i in range(self._n_steps)]
 
+        def raw_velocity(z_in: torch.Tensor, t_in: float) -> torch.Tensor:
+            with torch.no_grad():
+                return self._velocity_net(z_in, t_in, emb_batch, state_batch)
+
+        def rtc_velocity(z_in: torch.Tensor, t_in: float) -> torch.Tensor:
+            # The guided field replaces v everywhere, so RK4 integrates it as-is.
+            def field(x: torch.Tensor) -> torch.Tensor:
+                net_in = x.to(torch.float16)
+                return self._velocity_net(net_in, t_in, emb_batch, state_batch).to(x.dtype)
+
+            v = guided_velocity(
+                field,
+                z_in.to(torch.float32),
+                t_in,
+                guidance.target,
+                guidance.weights,
+                guidance.max_guidance_weight,
+                guidance.jacobian,
+            )
+            return v.to(z_in.dtype)
+
+        vel_fn = raw_velocity if guidance is None else rtc_velocity
+
         if self._use_rk4:
             for t in times:
-                def vel_fn(z_in: torch.Tensor, t_in: float) -> torch.Tensor:
-                    with torch.no_grad():
-                        return self._velocity_net(z_in, t_in, emb_batch, state_batch)
                 z = flow_matching_rk4_step(z, vel_fn, t, dt)
         else:
             for t in times:
-                with torch.no_grad():
-                    velocity = self._velocity_net(z, t, emb_batch, state_batch)
-                z = flow_matching_euler_step(z, velocity, dt)
+                z = flow_matching_euler_step(z, vel_fn(z, t), dt)
 
         return z  # [chunk_size, action_dim]
 
