@@ -238,7 +238,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "staleness_ms, embedding_dim, rtc, rtc_beta, rtc_schedule, rtc_jacobian")
     parser.add_argument("--modes", default="native,sync,async_sim",
                         help=f"comma list of {', '.join(MODES)}, or 'all'")
-    parser.add_argument("--blend-policies", default="linear_overlap",
+    parser.add_argument("--blend-policies", default="trim",
                         help=f"async modes sweep: {', '.join(BLEND_POLICIES)}")
     parser.add_argument("--inject-latency-ms", default="",
                         help="async_sim sweep of injected latencies, e.g. 0,150,500,1000,2000")

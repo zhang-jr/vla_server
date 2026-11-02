@@ -109,17 +109,17 @@ Four policies address this, selected by `blend_policy`.
 | Policy | Behavior |
 |---|---|
 | `replace` | Wholesale swap, no trim and no blending. Useful as a comparison baseline. |
-| `trim` | Drop the leading `min(k, latency_trim_steps)` steps of the new chunk, where `k` is the number of actions consumed since the last integration, then replace. Fixes the latency error but not the discontinuity. |
-| `linear_overlap` | `trim` plus a linear cross-fade across the overlap region — the queued tail fades from full weight to zero while the new chunk fades in. **Default.** |
+| `trim` | Drop the leading `min(k, latency_trim_steps)` steps of the new chunk, where `k` is the number of actions consumed since the last integration, then replace. Fixes the latency error but not the discontinuity. **Default.** |
+| `linear_overlap` | `trim` plus a linear cross-fade across the overlap region — the queued tail fades from full weight to zero while the new chunk fades in. |
 | `ensemble` | Every chunk is anchored to the global step its first action targets, and each executed action is an `exp(-decay * i)` weighted average over all chunks still covering that step, weighting the oldest surviving prediction most. |
 
-`linear_overlap` is the default because it addresses both problems at once and degrades gracefully: when the buffer has fully drained, the last executed action stands in as the old trajectory and is held for `blend_min_steps`, so the robot eases out of where it actually is rather than snapping to a fresh prediction's first step. `ensemble` averages away per-chunk prediction variance and is worth trying when a policy is noisy between samples, at the cost of holding several chunks at once.
+`trim` is the default because task success, not smoothness, decided it: on LIBERO-10 with π0.5 replanning every 5 steps, `linear_overlap` lost 15–19 pp against `trim` at 150–500 ms of latency (paired, p ≤ 0.004; see `BENCHMARKS.md`). The cross-fade keeps executing the old chunk's actions, which are stale by then. `linear_overlap` is still the smoothest policy and degrades gracefully: when the buffer has fully drained, the last executed action stands in as the old trajectory and is held for `blend_min_steps`, so the robot eases out of where it actually is rather than snapping to a fresh prediction's first step. For a smooth handover without the stale actions, use an RTC-capable head with `trim`. `ensemble` averages away per-chunk prediction variance and is worth trying when a policy is noisy between samples, at the cost of holding several chunks at once.
 
 ### Latency compensation
 
-`latency_trim_steps` is not a constant to be guessed at configuration time. `update_latency_trim(latency_ms)` derives it as `ceil(latency_ms / 1000 * control_rate_hz)` — the number of control steps that elapsed while the chunk was in flight, which is exactly the number of leading steps that were already stale on arrival. It is clamped by `max_latency_trim_steps` so one latency spike cannot swallow an entire chunk.
+`latency_trim_steps` is not a constant to be guessed at configuration time. `update_latency_trim(latency_ms)` derives it as `ceil(latency_ms / 1000 * control_rate_hz)` — the number of control steps that elapsed while the chunk was in flight, which is exactly the number of leading steps that were already stale on arrival. By default the trim is capped one step short of the incoming chunk, so every delay shorter than a chunk is fully compensated and a spike cannot swallow the whole chunk. An explicit `max_latency_trim_steps` sets a fixed ceiling instead; a ceiling below the real delay replays stale steps.
 
-`AsyncScheduler` calls this after every completed inference when `auto_latency_trim` is on, so compensation tracks the pipeline's measured behavior. When a chunk arrives so late that the trim would consume all of it, the chunk is dropped and the queued tail keeps running; the trace records this as a drop rather than silently substituting stale actions.
+`AsyncScheduler` calls this after every completed inference when `auto_latency_trim` is on, so compensation tracks the pipeline's measured behavior. With an explicit ceiling at or above the chunk length, a chunk that arrives so late that the trim would consume all of it is dropped and the queued tail keeps running; the trace records this as a drop rather than silently substituting stale actions.
 
 ### Seeding
 

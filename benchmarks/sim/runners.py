@@ -86,7 +86,7 @@ class RunConfig:
     episodes_per_task: int = 10
     num_tasks: int | None = None
     seed: int = 42
-    blend_policy: ChunkBlendPolicy = "linear_overlap"
+    blend_policy: ChunkBlendPolicy = "trim"
     chunk_threshold: float = 0.5
     max_trim_steps: int | None = None
     latency_ms: float | None = None

@@ -22,8 +22,11 @@ ADR-014 replaces the wholesale swap with four pluggable blend policies:
     ``trim``            Drop the leading ``min(k, latency_trim_steps)`` steps of
                         the new chunk (``k`` = steps consumed since the last
                         integrate), then replace. Fixes latency, not continuity.
+                        **Default.**
     ``linear_overlap``  ``trim`` plus a linear cross-fade over the overlap region
-                        (old 100%->0%, new 0%->100%). **Default.**
+                        (old 100%->0%, new 0%->100%). Smoothest, but mixes the
+                        old chunk's stale actions in; on LIBERO-10 it lost
+                        15-19 pp against ``trim`` at 150-500 ms (BENCHMARKS.md).
     ``ensemble``        ACT-style temporal ensembling: each chunk is anchored to
                         the global step it starts at, and every executed action
                         is an ``exp(-decay * i)`` weighted average over all
@@ -495,8 +498,10 @@ class ChunkBuffer:
         latency_trim_steps: Initial cap on the leading steps dropped from a new
             chunk. Superseded by :meth:`update_latency_trim` once real latency
             has been measured.
-        max_latency_trim_steps: Ceiling for the derived trim, so a single latency
-            spike cannot swallow an entire chunk.
+        max_latency_trim_steps: Ceiling for the derived trim. None caps it at
+            one step short of the incoming chunk, so a latency spike cannot
+            swallow a whole chunk while every shorter delay is still fully
+            compensated; a fixed ceiling below the delay replays stale steps.
         blend_min_steps: Overlap floor for the ``linear_overlap`` policy.
         ensemble_decay: ``m`` in ``exp(-m * i)`` for the ``ensemble`` policy.
         control_rate_hz: Control loop rate, used to convert a measured latency
@@ -509,9 +514,9 @@ class ChunkBuffer:
     def __init__(
         self,
         robot_id: str = "robot_0",
-        blend_policy: ChunkBlendPolicy = "linear_overlap",
+        blend_policy: ChunkBlendPolicy = "trim",
         latency_trim_steps: int = 0,
-        max_latency_trim_steps: int = 8,
+        max_latency_trim_steps: Optional[int] = None,
         blend_min_steps: int = 8,
         ensemble_decay: float = 0.01,
         control_rate_hz: float = 50.0,
@@ -527,7 +532,9 @@ class ChunkBuffer:
         # Unclamped steps-in-flight estimate; RTC's delay must not inherit the
         # trim ceiling, which exists to protect the blend, not the guidance.
         self._estimated_delay_steps = self._latency_trim_steps
-        self._max_latency_trim_steps = max(0, int(max_latency_trim_steps))
+        self._max_latency_trim_steps = (
+            None if max_latency_trim_steps is None else max(0, int(max_latency_trim_steps))
+        )
         self._control_rate_hz = max(1.0, float(control_rate_hz))
 
         if blend_policy == "linear_overlap":
@@ -565,7 +572,10 @@ class ChunkBuffer:
             chunk: The action chunk just produced for this robot.
         """
         actions = chunk.actions.detach().clone()
-        info = self._blender.integrate(actions, max_trim=self._latency_trim_steps)
+        max_trim = self._latency_trim_steps
+        if self._max_latency_trim_steps is None:
+            max_trim = min(max_trim, actions.shape[0] - 1)
+        info = self._blender.integrate(actions, max_trim=max_trim)
 
         with self._lock:
             self._head_type = chunk.head_type
@@ -623,7 +633,7 @@ class ChunkBuffer:
         ``ceil(latency_ms / 1000 * control_rate_hz)`` is how many control steps
         elapse while the chunk is in flight — exactly the number of leading steps
         that are already stale on arrival. Clamped to ``max_latency_trim_steps``
-        so one spike cannot swallow a whole chunk.
+        when one is set; otherwise :meth:`push` caps it by the chunk length.
 
         Args:
             latency_ms: Measured latency from observation to chunk availability.
@@ -632,7 +642,11 @@ class ChunkBuffer:
             The trim now in effect, in control steps.
         """
         estimated = int(math.ceil(max(0.0, latency_ms) / 1000.0 * self._control_rate_hz))
-        steps = min(estimated, self._max_latency_trim_steps)
+        steps = (
+            estimated
+            if self._max_latency_trim_steps is None
+            else min(estimated, self._max_latency_trim_steps)
+        )
         with self._lock:
             changed = steps != self._latency_trim_steps
             self._latency_trim_steps = steps

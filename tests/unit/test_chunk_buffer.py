@@ -76,8 +76,8 @@ class TestConstruction:
         assert buf.is_exhausted()
         assert buf.current() is None
 
-    def test_default_policy_is_linear_overlap(self):
-        assert ChunkBuffer().blend_policy == "linear_overlap"
+    def test_default_policy_is_trim(self):
+        assert ChunkBuffer().blend_policy == "trim"
 
 
 # ── replace: legacy double-buffer semantics ───────────────────────────────────
@@ -154,7 +154,7 @@ class TestTrimPolicy:
         assert buf.consumed_since_push == 0
 
 
-# ── linear_overlap: the default ───────────────────────────────────────────────
+# ── linear_overlap ──────────────────────────────────────────────────────────────
 
 class TestLinearOverlapPolicy:
     def test_first_chunk_passes_through_unblended(self):
@@ -295,6 +295,25 @@ class TestLatencyTrim:
     def test_clamped_by_max_latency_trim_steps(self):
         buf = ChunkBuffer(control_rate_hz=50.0, max_latency_trim_steps=4)
         assert buf.update_latency_trim(1000.0) == 4
+
+    def test_default_ceiling_compensates_delays_past_eight_steps(self):
+        buf = ChunkBuffer(control_rate_hz=20.0)
+        # 500 ms at 20 Hz = 10 steps; the old fixed ceiling of 8 replayed two stale ones.
+        assert buf.update_latency_trim(500.0) == 10
+        buf.push(make_ramp_chunk(size=16))
+        for _ in range(12):
+            buf.next_action()
+        buf.push(make_ramp_chunk(size=16))
+        assert buf.next_action()[0].item() == 10.0
+
+    def test_default_ceiling_keeps_the_last_step_of_a_late_chunk(self):
+        buf = ChunkBuffer(control_rate_hz=20.0)
+        buf.update_latency_trim(5000.0)
+        buf.push(make_ramp_chunk(size=16))
+        for _ in range(16):
+            buf.next_action()
+        buf.push(make_ramp_chunk(size=16))
+        assert buf.next_action()[0].item() == 15.0
 
     def test_zero_latency_means_no_trim(self):
         buf = ChunkBuffer(control_rate_hz=50.0)

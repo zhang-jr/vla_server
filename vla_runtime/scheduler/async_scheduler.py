@@ -139,7 +139,7 @@ class AsyncScheduler:
         budget_config: BudgetConfig | None = None,
         embedding_queue_maxsize: int = 2,
         robot_id: str = "robot_0",
-        blend_policy: ChunkBlendPolicy = "linear_overlap",
+        blend_policy: ChunkBlendPolicy = "trim",
         control_rate_hz: float = 50.0,
         auto_latency_trim: bool = True,
     ) -> None:
