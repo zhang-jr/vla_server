@@ -48,8 +48,8 @@ Policy options (``--policy-opt key=value``):
                      offline hosts, e.g. /models/SmolVLM2-500M-Video-Instruct
     rtc              1 to declare supports_rtc and guide the expert (default 0)
     rtc_beta         max guidance weight (default RTCConfig: 5)
-    rtc_schedule     exp / linear / ones / zeros (default exp)
-    rtc_jacobian     vjp / identity (default vjp)
+    rtc_schedule     zeros / exp / linear / ones (default zeros)
+    rtc_jacobian     identity / vjp (default identity)
 """
 
 from __future__ import annotations

@@ -223,6 +223,18 @@ def test_zero_weights_leave_velocity_unchanged():
 
 # ── Guidance preparation ──────────────────────────────────────────────────────
 
+def test_default_config_guides_only_the_frozen_steps():
+    config = RTCConfig()
+    assert config.prefix_schedule == "zeros" and config.jacobian == "identity"
+    guidance = prepare_guidance(
+        ActionHeadContext(prev_actions=torch.ones(CHUNK, ACTION_DIM), inference_delay_steps=3),
+        CHUNK,
+        ACTION_DIM,
+        config,
+    )
+    assert torch.equal(guidance.weights, torch.tensor([1.0] * 3 + [0.0] * (CHUNK - 3)))
+
+
 def test_prepare_guidance_without_previous_actions_is_unguided():
     config = RTCConfig()
     assert prepare_guidance(None, CHUNK, ACTION_DIM, config) is None

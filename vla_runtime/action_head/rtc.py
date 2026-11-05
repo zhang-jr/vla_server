@@ -57,19 +57,23 @@ class RTCConfig(BaseModel):
             paper uses 5; LeRobot defaults to 10. Larger values follow the
             previous chunk more tightly at the cost of sample quality.
         prefix_schedule: How the weight decays over the soft region of the
-            overlap. ``exp`` is the paper's choice, ``linear`` LeRobot's
-            default; ``ones`` / ``zeros`` are ablations (hard overlap / only
-            the frozen steps).
+            overlap. ``zeros`` (default) guides only the frozen steps, so the
+            chunk joins the queued actions and plans the rest from the new
+            observation; ``exp`` is the paper's choice, ``linear`` LeRobot's
+            default, ``ones`` a hard overlap. With frequent replanning the
+            soft region spans most of the chunk and pulls it toward the stale
+            plan: on LIBERO-10 (pi0.5, 500 episodes per cell) ``zeros`` beat
+            ``exp`` by 7.8-12.2 pp at 300-500 ms and tied it at 750-1000 ms.
         jacobian: ``vjp`` back-propagates the error through the velocity
-            network (the paper); ``identity`` skips it (LeRobot), one forward
-            per step instead of a forward plus a backward.
+            network (the paper); ``identity`` (default) skips it, as LeRobot
+            does, one forward per step instead of a forward plus a backward.
     """
 
     model_config = ConfigDict(frozen=True)
 
     max_guidance_weight: float = Field(default=5.0, gt=0)
-    prefix_schedule: PrefixSchedule = "exp"
-    jacobian: GuidanceJacobian = "vjp"
+    prefix_schedule: PrefixSchedule = "zeros"
+    jacobian: GuidanceJacobian = "identity"
 
 
 @dataclass(frozen=True)
