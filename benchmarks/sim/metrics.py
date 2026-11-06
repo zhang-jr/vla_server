@@ -43,6 +43,8 @@ class EpisodeRecord:
         overrun_steps: Realtime control ticks that missed their deadline.
         tick_lag_ms: How late each missed tick was.
         sim_step_ms: Wall time of each env.step (realtime diagnostics).
+        head_batch: Rows in the fleet head call that produced each chunk
+            (realtime, ADR-022).
         wall_s: Episode wall-clock time.
         jerk_rms / boundary_jump / boundary_ratio: Smoothness (see module doc).
     """
@@ -63,6 +65,7 @@ class EpisodeRecord:
     overrun_steps: int = 0
     tick_lag_ms: list[float] = field(default_factory=list)
     sim_step_ms: list[float] = field(default_factory=list)
+    head_batch: list[int] = field(default_factory=list)
     wall_s: float = 0.0
     jerk_rms: float | None = None
     boundary_jump: float | None = None
@@ -173,6 +176,7 @@ def summarize(
     head = [v for r in records for v in r.head_ms]
     lag = [v for r in records for v in r.tick_lag_ms]
     sim_step = [v for r in records for v in r.sim_step_ms]
+    head_batch = [v for r in records for v in r.head_batch]
     total_steps = sum(r.steps for r in records)
     busy_s = sum(r.wall_s for r in records)
 
@@ -207,6 +211,7 @@ def summarize(
         ),
         "tick_lag_p95_ms": _round(percentile(lag, 95)),
         "sim_step_p95_ms": _round(percentile(sim_step, 95)),
+        "head_batch_mean": _round(statistics.fmean(head_batch) if head_batch else None, 3),
         "jerk_rms": _round(_mean([r.jerk_rms for r in records]), 5),
         "boundary_jump": _round(_mean([r.boundary_jump for r in records]), 5),
         "boundary_ratio": _round(_mean([r.boundary_ratio for r in records]), 3),
@@ -231,6 +236,7 @@ _TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("vlm_p50_ms", "VLM P50"),
     ("head_p50_ms", "Head P50"),
     ("throughput_inferences_per_s", "推理/s"),
+    ("head_batch_mean", "head 批大小"),
     ("blocked_fraction", "阻塞占比"),
     ("underrun_rate", "欠载率"),
     ("overrun_rate", "tick 超时率"),

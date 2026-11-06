@@ -84,6 +84,8 @@ class RunConfig:
         num_robots: realtime — robots sharing the fleet's backbone.
         env_process: realtime — one process per robot env (False: threads of
             this process, which contend with inference for the GIL).
+        head_batch: realtime — most robots per fleet head call (ADR-022);
+            1 runs every request's head on its own.
         max_steps: Override every task's step limit.
         warmup: Untimed inferences before the first episode.
     """
@@ -101,6 +103,7 @@ class RunConfig:
     head_budget_ms: float = 1000.0
     num_robots: int = 1
     env_process: bool = True
+    head_batch: int = FleetConfig.max_head_batch
     max_steps: int | None = None
     warmup: int = 3
 
@@ -117,6 +120,8 @@ class RunConfig:
             parts.append(f"{self.num_robots}robot")
             if not self.env_process:
                 parts.append("thread-env")
+            if self.head_batch != FleetConfig.max_head_batch:
+                parts.append(f"hb{self.head_batch}")
         return "/".join(parts)
 
 
@@ -419,6 +424,8 @@ async def _realtime_episode(
         handle = await fleet.submit(robot_id, _request(obs, frame), head_context=head_context)
         chunk = await _drain(fleet.stream(handle))
         _raise_if_failed(handle)
+        if chunk is not None:
+            record.head_batch.append(int(chunk.metadata.get("head_batch_size", 1)))
         return chunk, (time.perf_counter() - t0) * 1000.0, handle.degraded
 
     # A fresh registration per episode: no condition survives from the last one.
@@ -581,6 +588,7 @@ async def run_benchmark(
                     max_robots=config.num_robots,
                     vlm_budget_ms=config.vlm_budget_ms,
                     action_head_budget_ms=config.head_budget_ms,
+                    max_head_batch=config.head_batch,
                 ),
             )
             await fleet.start()

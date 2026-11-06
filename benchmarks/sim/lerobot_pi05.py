@@ -13,7 +13,8 @@ Capabilities: π0.5 discretizes the normalized state into the language prompt
 ``state_placement="prefix"`` → coupled frequency (ADR-018), like SmolVLA.
 
 RTC (ADR-015, ``--policy-opt rtc=1``): the shared ``euler_denoise`` loop, same
-time convention as SmolVLA (1 = noise → 0 = data).
+time convention as SmolVLA (1 = noise → 0 = data). Head batching (ADR-022):
+``denoise_batch``, as for SmolVLA.
 
 Built against LeRobot 0.6 (``lerobot.policies.common`` helpers, transformers
 ``DynamicCache`` prefix). It relies on these internals, all used verbatim by
@@ -37,7 +38,7 @@ Policy options (``--policy-opt key=value``):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -48,10 +49,12 @@ from benchmarks.sim.lerobot_smolvla import (
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
+    batch_guidance,
     check_cameras,
     euler_denoise,
     parse_camera_map,
     pop_rtc_options,
+    stack_prefix_kv,
     wrap_prefix_kv_policy,
 )
 from benchmarks.sim.policies import BenchPolicy
@@ -183,21 +186,20 @@ class PI05Model:
             metadata={"sliding_windows": [sw for _, _, sw in entries]},
         )
 
-    def _prefix_cache(self, embedding: Embedding, clone: bool) -> Any:
+    def _prefix_cache(
+        self, embeddings: Sequence[Embedding], clone: bool
+    ) -> tuple[Any, torch.Tensor]:
+        """Prefix DynamicCache over per-row conditions → (cache, pad masks [B, L])."""
         from transformers import DynamicCache
 
-        return DynamicCache(
-            tuple(
-                (
-                    (kv.key.clone() if clone else kv.key).unsqueeze(0),
-                    (kv.value.clone() if clone else kv.value).unsqueeze(0),
-                    sw,
-                )
-                for kv, sw in zip(
-                    embedding.layer_kv, embedding.metadata["sliding_windows"], strict=True
-                )
-            )
+        windows = embeddings[0].metadata["sliding_windows"]
+        if any(e.metadata["sliding_windows"] != windows for e in embeddings):
+            raise ValueError("batched pi05 conditions disagree on sliding windows")
+        layers, pad_masks = stack_prefix_kv(embeddings, clone)
+        cache = DynamicCache(
+            tuple((key, value, sw) for (key, value), sw in zip(layers, windows, strict=True))
         )
+        return cache, pad_masks
 
     def denoise(
         self,
@@ -206,33 +208,40 @@ class PI05Model:
         guidance: RTCGuidance | None = None,
     ) -> torch.Tensor:
         """Action expert Euler loop over a cached prefix → [chunk_size, action_dim] (CPU)."""
-        if guidance is not None and guidance.jacobian == "vjp":
+        return self.denoise_batch([embedding], noise, [guidance])[0]
+
+    def denoise_batch(
+        self,
+        embeddings: Sequence[Embedding],
+        noise: torch.Tensor | None = None,
+        guidances: Sequence[RTCGuidance | None] | None = None,
+    ) -> list[torch.Tensor]:
+        """``denoise`` for several rows at once (ADR-022) → one CPU tensor per row."""
+        guidances = list(guidances) if guidances is not None else [None] * len(embeddings)
+        if any(g is not None and g.jacobian == "vjp" for g in guidances):
             with torch.no_grad():
-                return self._denoise(embedding, noise, guidance, detach_cache=True)
+                return self._denoise(embeddings, noise, guidances, detach_cache=True)
         with torch.inference_mode():
-            return self._denoise(embedding, noise, guidance, detach_cache=False)
+            return self._denoise(embeddings, noise, guidances, detach_cache=False)
 
     def _denoise(
         self,
-        embedding: Embedding,
+        embeddings: Sequence[Embedding],
         noise: torch.Tensor | None,
-        guidance: RTCGuidance | None,
+        guidances: Sequence[RTCGuidance | None],
         detach_cache: bool,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         model = self.policy.model
         config = self.config
         # Inference-mode tensors cannot enter an autograd graph; copies can.
-        past_key_values = self._prefix_cache(embedding, clone=detach_cache)
-        pad_masks = embedding.attention_mask.unsqueeze(0)
-        if detach_cache:
-            pad_masks = pad_masks.clone()
+        past_key_values, pad_masks = self._prefix_cache(embeddings, clone=detach_cache)
         device = pad_masks.device
+        shape = (len(embeddings), config.chunk_size, config.max_action_dim)
         if noise is None:
-            noise = model.sample_noise((1, config.chunk_size, config.max_action_dim), device)
-        target = None
-        if guidance is not None:
-            target = torch.zeros(config.chunk_size, config.max_action_dim, device=device)
-            target[:, : self.action_dim] = self.normalize_actions(guidance.target)
+            noise = model.sample_noise(shape, device)
+        target, guidance = batch_guidance(
+            guidances, self.normalize_actions, shape, self.action_dim, device
+        )
         model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
         x_t = euler_denoise(
             lambda x, t: model.denoise_step(
@@ -256,11 +265,11 @@ class PI05Model:
         """LeRobot's own monolithic path — the reference the split must match."""
         batch = self.preprocess(images, text, policy_state)
         actions = self.policy.predict_action_chunk(batch, noise=noise)
-        return self._postprocess(actions)
+        return self._postprocess(actions)[0]
 
-    def _postprocess(self, actions: torch.Tensor) -> torch.Tensor:
+    def _postprocess(self, actions: torch.Tensor) -> list[torch.Tensor]:
         out = self.post(actions)
-        return out[0].float().cpu()
+        return list(out.float().cpu().unbind(0))
 
 
 def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:

@@ -17,7 +17,15 @@ import torch
 
 from benchmarks.sim.env_process import EnvProcessError, ProcessEnv
 from benchmarks.sim.envs import EnvSpec, MockBenchEnv, env_factory, quat2axisangle
-from benchmarks.sim.lerobot_smolvla import _batch_first, _heads_first, _kv_layout, parse_camera_map
+from benchmarks.sim.lerobot_smolvla import (
+    _batch_first,
+    _heads_first,
+    _kv_layout,
+    batch_guidance,
+    euler_denoise,
+    parse_camera_map,
+    stack_prefix_kv,
+)
 from benchmarks.sim.metrics import (
     boundary_discontinuity,
     jerk_rms,
@@ -29,6 +37,9 @@ from benchmarks.sim.metrics import (
 from benchmarks.sim.policies import make_policy
 from benchmarks.sim.run import build_configs, parse_args
 from benchmarks.sim.runners import RunConfig, episode_plan, run_benchmark
+from vla_runtime.action_head.base import ActionHeadContext
+from vla_runtime.action_head.rtc import RTCConfig, prepare_guidance
+from vla_runtime.vlm.base import Embedding, LayerKV
 
 
 def _mock_env(**kwargs) -> MockBenchEnv:
@@ -254,6 +265,20 @@ class TestCli:
         (config,) = build_configs(args)
         assert not config.env_process and config.label.endswith("/thread-env")
 
+    def test_head_batch_flag(self):
+        args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "realtime",
+                           "--head-batch", "1"])
+        (config,) = build_configs(args)
+        assert config.head_batch == 1 and config.label.endswith("/hb1")
+        (default,) = build_configs(parse_args(["--env", "mock", "--policy", "mock",
+                                               "--modes", "realtime"]))
+        assert "hb" not in default.label
+
+    def test_realtime_records_head_batch(self):
+        records, wall_s = _run("realtime", num_robots=2, max_steps=20)
+        assert all(r.head_batch and set(r.head_batch) == {1} for r in records)  # mock head: no batching
+        assert summarize(records, wall_s)["head_batch_mean"] == 1.0
+
     def test_unknown_mode_rejected(self):
         args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "turbo"])
         with pytest.raises(SystemExit):
@@ -283,3 +308,78 @@ class TestSmolVLAHelpers:
         }
         with pytest.raises(ValueError):
             parse_camera_map("agentview")
+
+
+# ── Head batching helpers (ADR-022, no LeRobot needed) ────────────────────────
+
+def _kv_condition(length: int, seed: int, layers: int = 2, heads: int = 2, dim: int = 4) -> Embedding:
+    g = torch.Generator().manual_seed(seed)
+    return Embedding(
+        kind="per_layer_kv",
+        layer_kv=tuple(
+            LayerKV(key=torch.randn(heads, length, dim, generator=g),
+                    value=torch.randn(heads, length, dim, generator=g))
+            for _ in range(layers)
+        ),
+        attention_mask=torch.ones(length, dtype=torch.bool),
+        model_id="mock",
+    )
+
+
+class TestHeadBatchingHelpers:
+    def test_stack_prefix_kv_right_pads_and_masks(self):
+        short, long = _kv_condition(3, 0), _kv_condition(5, 1)
+        layers, masks = stack_prefix_kv([short, long])
+        assert masks.tolist() == [[True] * 3 + [False] * 2, [True] * 5]
+        key, value = layers[1]
+        assert key.shape == value.shape == (2, 2, 5, 4)
+        assert torch.equal(key[0, :, :3], short.layer_kv[1].key)
+        assert torch.equal(key[1], long.layer_kv[1].key)
+        assert torch.all(key[0, :, 3:] == 0)
+
+    def test_stack_prefix_kv_single_row_is_a_view(self):
+        cond = _kv_condition(3, 0)
+        layers, masks = stack_prefix_kv([cond])
+        assert layers[0][0].data_ptr() == cond.layer_kv[0].key.data_ptr()
+        assert stack_prefix_kv([cond], clone=True)[0][0][0].data_ptr() != cond.layer_kv[0].key.data_ptr()
+        assert masks.shape == (1, 3)
+
+    def test_stack_prefix_kv_rejects_mismatched_rows(self):
+        with pytest.raises(ValueError, match="disagree"):
+            stack_prefix_kv([_kv_condition(3, 0), _kv_condition(3, 1, heads=3)])
+
+    def test_batch_guidance_leaves_unguided_rows_at_zero_weight(self):
+        context = ActionHeadContext(prev_actions=torch.ones(6, 3), inference_delay_steps=2)
+        guided = prepare_guidance(context, 8, 3, RTCConfig())
+        target, guidance = batch_guidance(
+            [None, guided], lambda a: a * 2, (2, 8, 5), 3, torch.device("cpu")
+        )
+        assert target.shape == (2, 8, 5) and guidance.weights.shape == (2, 8)
+        assert torch.all(target[0] == 0) and torch.all(guidance.weights[0] == 0)
+        assert torch.equal(target[1, :, :3], guided.target * 2)
+        assert torch.equal(guidance.weights[1], guided.weights)
+        assert batch_guidance([None, None], lambda a: a, (2, 8, 5), 3, torch.device("cpu")) == (None, None)
+
+    def test_batch_guidance_rejects_mixed_settings(self):
+        context = ActionHeadContext(prev_actions=torch.ones(6, 3), inference_delay_steps=2)
+        rows = [prepare_guidance(context, 8, 3, RTCConfig(max_guidance_weight=b)) for b in (5.0, 1.0)]
+        with pytest.raises(ValueError, match="disagree"):
+            batch_guidance(rows, lambda a: a, (2, 8, 3), 3, torch.device("cpu"))
+
+    @pytest.mark.parametrize("jacobian", ["identity", "vjp"])
+    def test_batched_euler_matches_rows(self, jacobian):
+        # Row-independent toy field: any batching error shows up as a row mismatch.
+        weight = torch.randn(5, 5, generator=torch.Generator().manual_seed(0))
+
+        def velocity(x, t):
+            return torch.tanh(x @ weight) * t.view(-1, 1, 1)
+
+        noise = torch.randn(2, 8, 5, generator=torch.Generator().manual_seed(1))
+        context = ActionHeadContext(prev_actions=torch.ones(6, 3), inference_delay_steps=2)
+        rows = [None, prepare_guidance(context, 8, 3, RTCConfig(jacobian=jacobian))]
+        target, guidance = batch_guidance(rows, lambda a: a, (2, 8, 5), 3, torch.device("cpu"))
+        batched = euler_denoise(velocity, noise, 10, target, guidance)
+        for row, g in enumerate(rows):
+            t1, g1 = batch_guidance([g], lambda a: a, (1, 8, 5), 3, torch.device("cpu"))
+            alone = euler_denoise(velocity, noise[row : row + 1], 10, t1, g1)
+            torch.testing.assert_close(batched[row : row + 1], alone)

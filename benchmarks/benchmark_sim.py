@@ -9,8 +9,11 @@ What must hold before any LIBERO / ManiSkill number goes into BENCHMARKS.md:
   2. The runtime's RTC guidance on SmolVLA and π0.5 (``identity`` Jacobian) reproduces
      LeRobot's built-in RTCProcessor with shared noise; the ``vjp`` mode runs
      and its head latency is recorded.
-  3. Each simulator wrapper produces the observation format the policies read.
-  4. One short episode per mode runs end to end on LIBERO.
+  3. A batched expert pass over several robots' conditions (ADR-022, fleet head
+     batching) matches each row denoised alone with the same noise, including
+     RTC rows mixed with unguided ones and right-padded prefixes.
+  4. Each simulator wrapper produces the observation format the policies read.
+  5. One short episode per mode runs end to end on LIBERO.
 
 Every test skips when its simulator / LeRobot is not installed, and the
 conftest skips ``gpu`` tests where no CUDA device is visible. Run::
@@ -177,7 +180,7 @@ def _check_rtc_matches_lerobot(model) -> None:
                 prev_chunk_left_over=model.normalize_actions(prev).unsqueeze(0),
                 execution_horizon=overlap,
             )
-        )
+        )[0]
     finally:
         policy.config.rtc_config = saved
         policy.init_rtc_processor()
@@ -196,6 +199,87 @@ def test_smolvla_rtc_matches_lerobot_rtc_processor(smolvla_model):
 
 def test_pi05_rtc_matches_lerobot_rtc_processor(pi05_model):
     _check_rtc_matches_lerobot(pi05_model)
+
+
+def _check_batched_head_matches_rows(model) -> None:
+    """ADR-022: one batched expert pass == every row alone, same noise.
+
+    Batching changes the GEMM shapes, so under bf16 the kernels — and the
+    rounding — differ from the one-row pass: π0.5 rows move by up to ~1e-2
+    (mean ~3e-4) on actions of scale ~1, against ~0.9 for a different noise
+    sample. That is bounded by a few bf16 ulps (eps 7.8e-3), and closed-loop
+    success is the acceptance (CLAUDE.md principle 3). Everything batching
+    could get *wrong* is checked exactly within one pass: rows never leak
+    into each other, and a padded prefix decodes like the unpadded one.
+    """
+    from vla_runtime.action_head.base import ActionHeadContext
+    from vla_runtime.action_head.rtc import RTCConfig, prepare_guidance
+    from vla_runtime.vlm.base import Embedding, LayerKV
+
+    images, text, state = _synthetic_obs()
+    config = model.config
+    first = model.encode_prefix(images, text, state)
+    second = model.encode_prefix(
+        {k: v.flip(-1) for k, v in images.items()}, "open the top drawer", state + 0.05
+    )
+    # The first condition with 7 extra masked positions of garbage: it must
+    # decode exactly like the first, and it forces the others to be padded.
+    pad = 7
+    generator = torch.Generator(device=model.device).manual_seed(4)
+
+    def garbage(t: torch.Tensor) -> torch.Tensor:
+        extra = torch.randn(
+            t.shape[0], pad, t.shape[2], generator=generator, device=t.device, dtype=t.dtype
+        )
+        return torch.cat([t, extra], dim=1)
+
+    padded = Embedding(
+        kind="per_layer_kv",
+        layer_kv=tuple(LayerKV(key=garbage(kv.key), value=garbage(kv.value)) for kv in first.layer_kv),
+        attention_mask=torch.cat([first.attention_mask, first.attention_mask.new_zeros(pad)]),
+        model_id=first.model_id,
+        metadata=first.metadata,
+    )
+    rows = [first, second, padded, first]
+
+    other = torch.randn(
+        1, config.chunk_size, config.max_action_dim, generator=torch.Generator().manual_seed(2)
+    ).to(model.device)
+    prev = model.denoise(second, noise=other)[10:40]
+    guided = prepare_guidance(
+        ActionHeadContext(prev_actions=prev, inference_delay_steps=5),
+        config.chunk_size,
+        model.action_dim,
+        RTCConfig(),
+    )
+    guidances = [None, guided, None, None]
+    noise = torch.randn(
+        len(rows), config.chunk_size, config.max_action_dim,
+        generator=torch.Generator().manual_seed(1),
+    ).to(model.device)
+    noise[2] = noise[0]
+    noise[3] = noise[0]
+
+    batched = model.denoise_batch(rows, noise=noise.clone(), guidances=guidances)
+    assert len(batched) == len(rows)
+    # Same pass, same kernels: a repeated row is bit-identical (no leakage
+    # between rows), and masked padding changes nothing.
+    assert torch.equal(batched[3], batched[0])
+    torch.testing.assert_close(batched[2], batched[0], atol=1e-5, rtol=0)
+    # Against each row alone, including the RTC row among unguided ones.
+    for i, (row, g) in enumerate(zip(rows[:3], guidances[:3])):
+        alone = model.denoise(row, noise=noise[i : i + 1].clone(), guidance=g)
+        torch.testing.assert_close(batched[i], alone, atol=3e-2, rtol=0)
+        assert (batched[i] - alone).abs().mean() < 1e-3
+    assert not torch.allclose(batched[0], batched[1], atol=1e-1)
+
+
+def test_smolvla_batched_head_matches_rows(smolvla_model):
+    _check_batched_head_matches_rows(smolvla_model)
+
+
+def test_pi05_batched_head_matches_rows(pi05_model):
+    _check_batched_head_matches_rows(pi05_model)
 
 
 def _rtc_head_latency(model, record_property, label: str) -> None:

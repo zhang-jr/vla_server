@@ -20,6 +20,11 @@ and are normalized with the checkpoint's own action statistics before guiding.
 ``benchmarks/benchmark_sim.py`` checks the ``identity`` mode against LeRobot's
 built-in ``RTCProcessor`` with shared noise.
 
+Head batching (ADR-022): ``denoise_batch`` runs the expert over several robots'
+conditions at once — per-layer K/V stacked along the batch, shorter prefixes
+right-padded and masked out, one noise / RTC row each. ``denoise`` is the
+one-row case of the same code, so the native-alignment tests cover it too.
+
 The model-agnostic half — ``PrefixKVBackbone``, ``PrefixKVExpertHead``, the
 ``euler_denoise`` loop and ``wrap_prefix_kv_policy`` — is shared with the π0.5
 adapter (``benchmarks/sim/lerobot_pi05.py``); only ``SmolVLAModel`` is SmolVLA-specific.
@@ -56,8 +61,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Protocol
 
@@ -250,26 +256,39 @@ class SmolVLAModel:
             metadata={"layer_indices": layer_indices, "kv_layout": layout},
         )
 
-    def _prefix_cache(self, embedding: Embedding, clone: bool) -> Any:
-        """Rebuild the model's prefix cache from a per_layer_kv condition."""
-        layout = embedding.metadata["kv_layout"]
+    def _prefix_cache(
+        self, embeddings: Sequence[Embedding], clone: bool
+    ) -> tuple[Any, torch.Tensor]:
+        """Rebuild the model's prefix cache from per_layer_kv conditions, one row each.
+
+        Returns:
+            (cache, prefix pad masks [B, L]).
+        """
+        layout = embeddings[0].metadata["kv_layout"]
+        layer_indices = embeddings[0].metadata["layer_indices"]
+        if any(
+            e.metadata["kv_layout"] != layout or e.metadata["layer_indices"] != layer_indices
+            for e in embeddings
+        ):
+            raise ValueError("batched SmolVLA conditions disagree on their K/V layout")
+        layers, pad_masks = stack_prefix_kv(embeddings, clone)
         pairs = [
             (
                 i,
-                _batch_first(kv.key.clone() if clone else kv.key, layout),
-                _batch_first(kv.value.clone() if clone else kv.value, layout),
+                key.transpose(1, 2) if layout == "BLHD" else key,
+                value.transpose(1, 2) if layout == "BLHD" else value,
             )
-            for i, kv in zip(embedding.metadata["layer_indices"], embedding.layer_kv)
+            for i, (key, value) in zip(layer_indices, layers)
         ]
         if self._legacy_cache:
-            return {i: {"key_states": k, "value_states": v} for i, k, v in pairs}
+            return {i: {"key_states": k, "value_states": v} for i, k, v in pairs}, pad_masks
         from transformers import DynamicCache
 
         cache = DynamicCache()
         for i, k, v in pairs:
             # DynamicCache stores [B, H, L, D].
             cache.update(_to_bhld(k, layout), _to_bhld(v, layout), i)
-        return cache
+        return cache, pad_masks
 
     def denoise(
         self,
@@ -283,34 +302,47 @@ class SmolVLAModel:
         previous chunk's tail; the ``vjp`` mode needs autograd, so it runs
         outside inference mode on a copy of the cached K/V.
         """
-        if guidance is not None and guidance.jacobian == "vjp":
+        return self.denoise_batch([embedding], noise, [guidance])[0]
+
+    def denoise_batch(
+        self,
+        embeddings: Sequence[Embedding],
+        noise: torch.Tensor | None = None,
+        guidances: Sequence[RTCGuidance | None] | None = None,
+    ) -> list[torch.Tensor]:
+        """``denoise`` for several rows at once (ADR-022) → one CPU tensor per row.
+
+        Args:
+            embeddings: One per_layer_kv condition per row.
+            noise: ``[B, chunk_size, max_action_dim]``; sampled when None.
+            guidances: One RTC guidance (or None) per row.
+        """
+        guidances = list(guidances) if guidances is not None else [None] * len(embeddings)
+        if any(g is not None and g.jacobian == "vjp" for g in guidances):
             with torch.no_grad():
-                return self._denoise(embedding, noise, guidance, detach_cache=True)
+                return self._denoise(embeddings, noise, guidances, detach_cache=True)
         with torch.inference_mode():
-            return self._denoise(embedding, noise, guidance, detach_cache=False)
+            return self._denoise(embeddings, noise, guidances, detach_cache=False)
 
     def _denoise(
         self,
-        embedding: Embedding,
+        embeddings: Sequence[Embedding],
         noise: torch.Tensor | None,
-        guidance: RTCGuidance | None,
+        guidances: Sequence[RTCGuidance | None],
         detach_cache: bool,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         model = self.policy.model
         config = self.config
         # Inference-mode tensors cannot enter an autograd graph; copies can.
-        past_key_values = self._prefix_cache(embedding, clone=detach_cache)
-        pad_masks = embedding.attention_mask.unsqueeze(0)
-        if detach_cache:
-            pad_masks = pad_masks.clone()
+        past_key_values, pad_masks = self._prefix_cache(embeddings, clone=detach_cache)
         device = pad_masks.device
+        shape = (len(embeddings), config.chunk_size, config.max_action_dim)
         if noise is None:
-            noise = model.sample_noise((1, config.chunk_size, config.max_action_dim), device)
-        target = None
-        if guidance is not None:
-            # Env space → normalized, zero-padded to the expert's max_action_dim.
-            target = torch.zeros(config.chunk_size, config.max_action_dim, device=device)
-            target[:, : self.action_dim] = self.normalize_actions(guidance.target)
+            noise = model.sample_noise(shape, device)
+        # Env space → normalized, zero-padded to the expert's max_action_dim.
+        target, guidance = batch_guidance(
+            guidances, self.normalize_actions, shape, self.action_dim, device
+        )
         x_t = euler_denoise(
             lambda x, t: model.denoise_step(pad_masks, past_key_values, x, t),
             noise,
@@ -332,11 +364,102 @@ class SmolVLAModel:
         """LeRobot's own monolithic path — the reference the split must match."""
         batch = self.preprocess(images, text, policy_state)
         actions = self.policy.predict_action_chunk(batch, noise=noise)
-        return self._postprocess(actions)
+        return self._postprocess(actions)[0]
 
-    def _postprocess(self, actions: torch.Tensor) -> torch.Tensor:
+    def _postprocess(self, actions: torch.Tensor) -> list[torch.Tensor]:
         out = self.post(actions)
-        return out[0].float().cpu()
+        return list(out.float().cpu().unbind(0))
+
+
+def stack_prefix_kv(
+    embeddings: Sequence[Embedding], clone: bool = False
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    """Per-row per_layer_kv conditions → per-layer ``[B, H, L, D]`` K/V and ``[B, L]`` pad mask.
+
+    Rows shorter than the longest prefix are right-padded with zeros and
+    masked out, so the expert attends to exactly the positions it would see
+    row by row. One row is passed through without padding; ``clone`` copies
+    it (stacking already copies several rows).
+
+    Raises:
+        ValueError: If the rows disagree on layer count or K/V shape.
+    """
+    first = embeddings[0]
+    num_layers = len(first.layer_kv)
+    longest = max(e.attention_mask.shape[0] for e in embeddings)
+    for e in embeddings:
+        if len(e.layer_kv) != num_layers or any(
+            kv.key.shape[0::2] != ref.key.shape[0::2] for kv, ref in zip(e.layer_kv, first.layer_kv)
+        ):
+            raise ValueError("batched conditions disagree on layer count or K/V shape")
+
+    def rows(get: Callable[[Embedding], torch.Tensor], pad_dim: int, fill: Any) -> torch.Tensor:
+        if len(embeddings) == 1:
+            t = get(first)
+            return (t.clone() if clone else t).unsqueeze(0)
+        padded = []
+        for e in embeddings:
+            t = get(e)
+            missing = longest - t.shape[pad_dim]
+            if missing:
+                pad_shape = list(t.shape)
+                pad_shape[pad_dim] = missing
+                t = torch.cat([t, t.new_full(pad_shape, fill)], dim=pad_dim)
+            padded.append(t)
+        return torch.stack(padded)
+
+    layers = [
+        (
+            rows(lambda e, i=i: e.layer_kv[i].key, 1, 0),
+            rows(lambda e, i=i: e.layer_kv[i].value, 1, 0),
+        )
+        for i in range(num_layers)
+    ]
+    return layers, rows(lambda e: e.attention_mask, 0, False)
+
+
+def batch_guidance(
+    guidances: Sequence[RTCGuidance | None],
+    normalize: Callable[[torch.Tensor], torch.Tensor],
+    shape: tuple[int, int, int],
+    action_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, RTCGuidance | None]:
+    """Per-row RTC guidance → the batched target and weights ``euler_denoise`` takes.
+
+    Unguided rows get zero weights, which leaves their velocity untouched, so
+    guided and unguided rows can share a batch.
+
+    Args:
+        guidances: One guidance (or None) per row.
+        normalize: Executed-space actions → the model's normalized space.
+        shape: ``(B, chunk_size, max_action_dim)``.
+        action_dim: Leading action columns the target fills.
+        device: Where the target lives.
+
+    Returns:
+        (normalized target ``[B, chunk, max_action_dim]``, guidance with
+        ``[B, chunk]`` weights), or (None, None) when no row is guided.
+
+    Raises:
+        ValueError: If guided rows disagree on beta or the Jacobian mode.
+    """
+    active = [g for g in guidances if g is not None]
+    if not active:
+        return None, None
+    first = active[0]
+    if any(
+        (g.max_guidance_weight, g.jacobian) != (first.max_guidance_weight, first.jacobian)
+        for g in active
+    ):
+        raise ValueError("batched RTC rows disagree on max_guidance_weight or jacobian")
+    target = torch.zeros(shape, device=device)
+    weights = torch.zeros(shape[0], shape[1])
+    for row, g in enumerate(guidances):
+        if g is not None:
+            target[row, :, :action_dim] = normalize(g.target)
+            weights[row] = g.weights
+    return target, dataclasses.replace(first, target=target, weights=weights)
 
 
 def euler_denoise(
@@ -353,17 +476,18 @@ def euler_denoise(
 
     Args:
         velocity_fn: ``(x_t, time[1]) → v_t`` in the model's convention.
-        noise: ``x`` at time 1, ``[1, chunk_size, max_action_dim]``.
+        noise: ``x`` at time 1, ``[B, chunk_size, max_action_dim]``.
         num_steps: Euler steps.
-        target: Normalized, padded previous actions; required with ``guidance``.
-        guidance: RTC guidance, or None for the plain loop.
+        target: Normalized, padded previous actions ``[B, chunk, max_action_dim]``;
+            required with ``guidance``.
+        guidance: RTC guidance with ``[B, chunk]`` weights, or None for the plain loop.
     """
     device = noise.device
     dt = -1.0 / num_steps
     x_t = noise
     for step in range(num_steps):
         time = 1.0 + step * dt
-        step_time = torch.tensor(time, dtype=torch.float32, device=device).expand(1)
+        step_time = torch.tensor(time, dtype=torch.float32, device=device).expand(noise.shape[0])
         if guidance is None:
             v_t = velocity_fn(x_t, step_time)
         else:
@@ -436,6 +560,13 @@ class PrefixKVModel(Protocol):
         noise: torch.Tensor | None = None,
         guidance: RTCGuidance | None = None,
     ) -> torch.Tensor: ...
+
+    def denoise_batch(
+        self,
+        embeddings: Sequence[Embedding],
+        noise: torch.Tensor | None = None,
+        guidances: Sequence[RTCGuidance | None] | None = None,
+    ) -> list[torch.Tensor]: ...
 
     def native_chunk(
         self,
@@ -519,7 +650,8 @@ class PrefixKVExpertHead:
     """ActionHeadRuntime over a LeRobot action expert (flow matching, iterative).
 
     Instances spawned for different robots share the one loaded model; the
-    expert keeps no state between calls, so nothing per robot needs copying.
+    expert keeps no state between calls, so nothing per robot needs copying
+    and any instance can serve a batch of robots (``predict_batch``, ADR-022).
     """
 
     accepted_condition_kinds: tuple[str, ...] = ("per_layer_kv",)
@@ -573,6 +705,29 @@ class PrefixKVExpertHead:
             actions = self._model.denoise(embedding, guidance=guidance)
         except Exception as exc:
             raise ActionHeadFailureError("flow_matching", exc, error_context) from exc
+        return self._chunk(actions, guidance)
+
+    def predict_batch(
+        self,
+        embeddings: Sequence[Embedding],
+        robot_states: Sequence[RobotState],
+        contexts: Sequence[ActionHeadContext | None],
+    ) -> list[ActionChunk]:
+        """One expert pass over several robots' conditions (BatchedActionHead, ADR-022)."""
+        error_context = ErrorContext(
+            trace_id=_tracer.trace_id, module_name="benchmarks.prefix_kv.head"
+        )
+        try:
+            guidances = [
+                prepare_guidance(c, self.chunk_size, self.action_dim, self._rtc_config)
+                for c in contexts
+            ]
+            rows = self._model.denoise_batch(embeddings, guidances=guidances)
+        except Exception as exc:
+            raise ActionHeadFailureError("flow_matching", exc, error_context) from exc
+        return [self._chunk(actions, g) for actions, g in zip(rows, guidances, strict=True)]
+
+    def _chunk(self, actions: torch.Tensor, guidance: RTCGuidance | None) -> ActionChunk:
         metadata: dict[str, Any] = {
             "n_steps": self._model.num_steps,
             "rtc": guidance is not None,
