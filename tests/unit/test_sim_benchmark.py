@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+from benchmarks.sim.env_process import EnvProcessError, ProcessEnv
 from benchmarks.sim.envs import EnvSpec, MockBenchEnv, env_factory, quat2axisangle
 from benchmarks.sim.lerobot_smolvla import _batch_first, _heads_first, _kv_layout, parse_camera_map
 from benchmarks.sim.metrics import (
@@ -36,11 +37,16 @@ def _mock_env(**kwargs) -> MockBenchEnv:
     return MockBenchEnv(**defaults)
 
 
+# Same env as _mock_env, through the picklable factory a child process can build.
+_MOCK_OPTS = {"num_tasks": "2", "steps_to_done": "12", "success_probability": "0.5",
+              "control_hz": "100.0"}
+
+
 def _run(mode: str, policy_opts: dict[str, str] | None = None, **config_kwargs):
     env = _mock_env()
     bench = make_policy("mock", env.spec, {"chunk_size": "16", **(policy_opts or {})})
     config = RunConfig(mode=mode, episodes_per_task=2, warmup=1, **config_kwargs)
-    return asyncio.run(run_benchmark(bench, _mock_env, config))
+    return asyncio.run(run_benchmark(bench, env_factory("mock", _MOCK_OPTS), config))
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -165,12 +171,64 @@ class TestRunners:
             (t, e) for t in _mock_env().task_names() for e in range(2)
         )
 
+    def test_realtime_thread_envs_match_process_envs(self):
+        threaded, _ = _run("realtime", num_robots=2, max_steps=20, env_process=False)
+        isolated, _ = _run("realtime", num_robots=2, max_steps=20)
+
+        def by_episode(records):
+            return [r.success for r in sorted(records, key=lambda r: (r.task, r.episode))]
+
+        assert by_episode(threaded) == by_episode(isolated)
+
     def test_summary_fields(self):
         records, wall_s = _run("sync")
         summary = summarize(records, wall_s, extra={"run": "sync"})
         assert summary["episodes"] == 4
         assert summary["latency_p50_ms"] is not None
         assert 0.0 <= summary["success_rate"] <= 1.0
+
+
+# ── Env process ───────────────────────────────────────────────────────────────
+
+class TestProcessEnv:
+    def test_round_trip_matches_in_process_env(self):
+        local = _mock_env()
+        remote = ProcessEnv(env_factory("mock", _MOCK_OPTS))
+        try:
+            assert remote.spec == local.spec
+            assert remote.task_names() == local.task_names()
+            task = local.task_names()[0]
+            assert remote.max_steps(task) == local.max_steps(task)
+            pairs = [(remote.reset(task, 0, 7), local.reset(task, 0, 7))]
+            action = torch.full((7,), 0.5)
+            for _ in range(3):
+                r_obs, r_rew, r_done, _ = remote.step(action)
+                l_obs, l_rew, l_done, _ = local.step(action)
+                assert (r_rew, r_done) == (l_rew, l_done)
+                pairs.append((r_obs, l_obs))
+            for r_obs, l_obs in pairs:
+                for name, image in l_obs["images"].items():
+                    assert torch.equal(r_obs["images"][name], image)  # uint8 transport is exact
+                assert torch.equal(
+                    r_obs["robot_state"].extra["policy_state"],
+                    l_obs["robot_state"].extra["policy_state"],
+                )
+        finally:
+            remote.close()
+
+    def test_call_errors_surface_in_parent(self):
+        remote = ProcessEnv(env_factory("mock", _MOCK_OPTS))
+        try:
+            remote.reset(remote.task_names()[0], 0, 7)
+            with pytest.raises(EnvProcessError, match="step"):
+                remote.step(None)  # type: ignore[arg-type]
+            assert remote.max_steps(remote.task_names()[0]) > 0  # the child survives a failed call
+        finally:
+            remote.close()
+
+    def test_build_failure_surfaces_in_parent(self):
+        with pytest.raises(EnvProcessError, match="start"):
+            ProcessEnv(env_factory("mock", {"no_such_option": "1"}))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -189,6 +247,12 @@ class TestCli:
         assert "async_sim/ensemble/lat500ms" in labels
         assert "realtime/replace/4robot" in labels
         assert len(labels) == 1 + 2 * 2 + 2 * 2
+
+    def test_realtime_env_flag(self):
+        args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "realtime",
+                           "--realtime-env", "thread"])
+        (config,) = build_configs(args)
+        assert not config.env_process and config.label.endswith("/thread-env")
 
     def test_unknown_mode_rejected(self):
         args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "turbo"])

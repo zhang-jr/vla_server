@@ -16,6 +16,9 @@
     realtime   FleetScheduler with N robots, each env stepped by a wall-clock
                control loop at the env's control rate. What deployment feels:
                buffer underruns, missed ticks, fleet contention on one VLM.
+               Each env runs in its own process by default, like a robot on
+               its own machine; in-process envs contend with inference for
+               the GIL (``benchmarks.sim.env_process``).
 
 Blocking modes pause the sim during inference, so their success rate ignores
 latency; ``blocked_fraction`` reports how long a real robot would stand still.
@@ -41,6 +44,7 @@ from typing import Any, Literal, TypeVar
 
 import torch
 
+from benchmarks.sim.env_process import ProcessEnv
 from benchmarks.sim.envs import BenchEnv, EnvSpec, Observation
 from benchmarks.sim.metrics import EpisodeRecord
 from benchmarks.sim.policies import BenchPolicy
@@ -78,6 +82,8 @@ class RunConfig:
             emulate a slower edge device).
         vlm_budget_ms / head_budget_ms: Scheduler latency budgets.
         num_robots: realtime — robots sharing the fleet's backbone.
+        env_process: realtime — one process per robot env (False: threads of
+            this process, which contend with inference for the GIL).
         max_steps: Override every task's step limit.
         warmup: Untimed inferences before the first episode.
     """
@@ -94,6 +100,7 @@ class RunConfig:
     vlm_budget_ms: float = 2000.0
     head_budget_ms: float = 1000.0
     num_robots: int = 1
+    env_process: bool = True
     max_steps: int | None = None
     warmup: int = 3
 
@@ -108,6 +115,8 @@ class RunConfig:
             parts.append(f"x{self.latency_scale:g}")
         if self.mode == "realtime":
             parts.append(f"{self.num_robots}robot")
+            if not self.env_process:
+                parts.append("thread-env")
         return "/".join(parts)
 
 
@@ -118,6 +127,8 @@ class EnvWorker:
 
     Simulator and EGL rendering contexts are bound to their creating thread;
     keeping every call on that thread also keeps env.step off the event loop.
+    With ``isolate`` the env lives in a child process and the thread only
+    waits on its pipe.
     """
 
     def __init__(self, pool: ThreadPoolExecutor, env: BenchEnv) -> None:
@@ -125,9 +136,10 @@ class EnvWorker:
         self.env = env
 
     @classmethod
-    async def create(cls, factory: Callable[[], BenchEnv]) -> EnvWorker:
+    async def create(cls, factory: Callable[[], BenchEnv], isolate: bool = False) -> EnvWorker:
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sim-env")
-        env = await asyncio.get_running_loop().run_in_executor(pool, factory)
+        build: Callable[[], BenchEnv] = (lambda: ProcessEnv(factory)) if isolate else factory
+        env = await asyncio.get_running_loop().run_in_executor(pool, build)
         return cls(pool, env)
 
     async def call(self, fn: Callable[..., T], *args: Any) -> T:
@@ -508,7 +520,8 @@ async def run_benchmark(
 
     Args:
         bench: The policy.
-        env_factory: Builds an env (called once per extra realtime robot).
+        env_factory: Builds an env (called once per realtime robot; picklable
+            when ``config.env_process``).
         config: Mode and knobs.
         worker: Reuse an existing env worker for robot 0 (keeps the sim warm
             across modes); created and closed here when None.
@@ -550,10 +563,18 @@ async def run_benchmark(
                 if on_episode:
                     on_episode(record)
         else:
-            extra_workers = [
-                await EnvWorker.create(env_factory) for _ in range(config.num_robots - 1)
-            ]
-            workers = [worker, *extra_workers]
+            if config.env_process:
+                # Robot 0's in-process env stays idle; every robot gets its own process.
+                extra_workers = [
+                    await EnvWorker.create(env_factory, isolate=True)
+                    for _ in range(config.num_robots)
+                ]
+                workers = extra_workers
+            else:
+                extra_workers = [
+                    await EnvWorker.create(env_factory) for _ in range(config.num_robots - 1)
+                ]
+                workers = [worker, *extra_workers]
             fleet = FleetScheduler.from_policy(
                 bench.policy,
                 FleetConfig(

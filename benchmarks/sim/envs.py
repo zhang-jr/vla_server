@@ -20,6 +20,7 @@ its simulator installed.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import random
@@ -480,7 +481,8 @@ def env_factory(name: str, options: dict[str, str]) -> Callable[[], BenchEnv]:
 
     Rendering contexts (EGL) and simulator handles are bound to the thread that
     creates them; the runners construct and step every env on one dedicated
-    thread.
+    thread. The constructor is picklable, so it can also build the env in a
+    child process (``benchmarks.sim.env_process``).
 
     Args:
         name: ``mock``, ``libero`` or ``maniskill``.
@@ -491,7 +493,7 @@ def env_factory(name: str, options: dict[str, str]) -> Callable[[], BenchEnv]:
         kwargs: dict[str, Any] = {
             k: _parse_number(v) for k, v in opts.items()
         }
-        return lambda: MockBenchEnv(**kwargs)
+        return functools.partial(MockBenchEnv, **kwargs)
     if name == "libero":
         kwargs = {}
         if "suite" in opts:
@@ -505,7 +507,7 @@ def env_factory(name: str, options: dict[str, str]) -> Callable[[], BenchEnv]:
         if "task_ids" in opts:
             kwargs["task_ids"] = [int(x) for x in opts.pop("task_ids").split(",") if x]
         _reject_unknown(name, opts)
-        return lambda: LiberoEnv(**kwargs)
+        return functools.partial(LiberoEnv, **kwargs)
     if name == "maniskill":
         kwargs = {}
         if "env_ids" in opts:
@@ -517,7 +519,7 @@ def env_factory(name: str, options: dict[str, str]) -> Callable[[], BenchEnv]:
             if key in opts:
                 kwargs[key] = int(opts.pop(key))
         _reject_unknown(name, opts)
-        return lambda: ManiSkillEnv(**kwargs)
+        return functools.partial(ManiSkillEnv, **kwargs)
     raise ValueError(f"unknown env {name!r}; expected mock, libero or maniskill")
 
 

@@ -138,7 +138,8 @@ def build_configs(args: argparse.Namespace) -> list[RunConfig]:
             ]
         else:
             configs += [
-                replace(base, mode=mode, blend_policy=b, num_robots=n)
+                replace(base, mode=mode, blend_policy=b, num_robots=n,
+                        env_process=args.realtime_env == "process")
                 for b in blends
                 for n in robots
             ]
@@ -245,6 +246,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--latency-scale", type=float, default=1.0,
                         help="async_sim: multiply measured latency (emulate slower hardware)")
     parser.add_argument("--robots", default="1", help="realtime sweep of fleet sizes, e.g. 1,2,4")
+    parser.add_argument("--realtime-env", choices=("process", "thread"), default="process",
+                        help="realtime: one process per robot env (default), or threads of the "
+                             "server process (contend with inference for the GIL)")
     parser.add_argument("--episodes", type=int, default=10, help="episodes per task")
     parser.add_argument("--num-tasks", type=int, default=None, help="first N tasks (default all)")
     parser.add_argument("--max-steps", type=int, default=None, help="override task step limits")
