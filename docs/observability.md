@@ -67,8 +67,11 @@ These are produced without any instrumentation on your part.
 | `rolling_budget_violation` | Budget violations exceed the tolerated fraction | `latency_ms`, `budget_ms`, `stats` |
 | `inference_complete` | A request finishes | `action_ms`, `total_ms`, `chunk_size`, `latency_trim_steps` |
 | `fleet_request_failed` | One robot's request fails in the shared dispatch loop | `robot_id`, `error_type`, `error` |
+| `fleet_head_batch` | One `predict_batch` call served several robots (ADR-022) | `batch_size`, `head_ms` |
+| `fleet_head_batch_fallback` | A `predict_batch` call failed; its rows retry one by one | `batch_size`, `error_type`, `error` |
+| `fleet_inference_complete` | A robot's chunk is ready | `action_ms`, `head_wait_ms`, `head_batch_size` |
 
-Spans cover `perception_encode`, `action_gen_predict`, `scheduler_replan`, `flow_matching_predict`, `diffusion_predict`, `discrete_token_predict`, and `fleet_process`. `perception_encode` carries `frequency_mode`, `condition_kind`, and `condition_bytes` — the last is the per-frame payload an edge-cloud split at the backbone boundary would have to ship.
+Spans cover `perception_encode`, `action_gen_predict`, `scheduler_replan`, `flow_matching_predict`, `diffusion_predict`, `discrete_token_predict`, and `fleet_vlm_stage`. `perception_encode` carries `frequency_mode`, `condition_kind`, and `condition_bytes` — the last is the per-frame payload an edge-cloud split at the backbone boundary would have to ship.
 
 Two of these deserve attention when reading a trace. `action_buffer_gap` is the one that corresponds directly to physical symptoms — it means the control loop had nothing to execute, which is what a stutter actually is — and it is recorded as an interval rather than a counter because the tail duration is the part that matters. `dropped` on `chunk_pushed` means a chunk arrived so late that the entire thing was already stale, which is a stronger signal than latency percentiles: the pipeline is no longer keeping up at all.
 

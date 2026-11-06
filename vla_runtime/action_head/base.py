@@ -23,6 +23,7 @@ Quantization constraint (ADR-003):
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Protocol, runtime_checkable
 
@@ -370,3 +371,48 @@ class RealTimeChunkingHead(Protocol):
 def head_supports_rtc(head: object) -> bool:
     """Whether ``head`` can consume an ActionHeadContext."""
     return isinstance(head, RealTimeChunkingHead) and bool(getattr(head, "supports_rtc", False))
+
+
+@runtime_checkable
+class BatchedActionHead(Protocol):
+    """A head that predicts for several robots in one call (ADR-022).
+
+    Optional, like WeightSharingHead: the fleet batches rows only across
+    instances that share weights and all implement this Protocol, and calls
+    ``predict_batch`` on one of them. That instance therefore serves rows
+    belonging to other robots' instances, so the call must keep no per-robot
+    state: every row has its own noise, condition, state, RTC context and
+    output, and nothing survives the call.
+    """
+
+    def shares_weights_with(self, other: object) -> bool:
+        """Whether ``other`` reads the same weight tensors as this instance."""
+        ...
+
+    def predict_batch(
+        self,
+        embeddings: Sequence["vla_runtime.vlm.base.Embedding"],  # noqa: F821
+        robot_states: Sequence[RobotState],
+        contexts: Sequence[Optional[ActionHeadContext]],
+    ) -> list[ActionChunk]:
+        """One chunk per row, each as ``predict()`` would return it for that row.
+
+        Args:
+            embeddings: One condition per row.
+            robot_states: One state per row.
+            contexts: One RTC context per row; None samples that row unguided.
+
+        Raises:
+            ActionHeadFailureError: If the batch fails; the caller falls back
+                to per-row ``predict()`` so one bad row fails only itself.
+        """
+        ...
+
+
+def heads_batch_together(head: object, other: object) -> bool:
+    """Whether the fleet may run ``head`` and ``other`` in one ``predict_batch``."""
+    return (
+        isinstance(head, BatchedActionHead)
+        and isinstance(other, BatchedActionHead)
+        and head.shares_weights_with(other)
+    )

@@ -14,7 +14,7 @@ Source: `vla_runtime/serving/fleet.py`
 | Latency budget tracking | One per robot | Robots differ in cadence and payload |
 | Stale-embedding counter | One per robot | One robot's degradation must not implicate another |
 
-This is deliberately not the batching model used in LLM serving. Requests there can be interleaved freely because they share nothing but the model; here every request belongs to a physical machine with its own real-time deadline and its own state. Merging them into one batch would couple the deadlines together, and one slow robot would drag the rest with it. Sharing stops at the backbone instance: the dispatch loop encodes one request at a time, in priority order.
+This is deliberately not the batching model used in LLM serving. Requests there can be interleaved freely because they share nothing but the model; here every request belongs to a physical machine with its own real-time deadline and its own state. Merging them into one batch would couple the deadlines together, and one slow robot would drag the rest with it. The backbone therefore encodes one request at a time, in priority order. Cross-robot batching is applied only where it costs no robot its deadline: the action head (see [Head batching](#head-batching)).
 
 ## Usage
 
@@ -45,6 +45,7 @@ class FleetConfig:
     priority_levels: int = 3
     vlm_budget_ms: float = 200.0
     action_head_budget_ms: float = 50.0
+    max_head_batch: int = 8      # 1 disables head batching
 ```
 
 How long a reused condition stays usable is not a fleet setting: it is the policy's calibrated `max_condition_staleness_ms`.
@@ -58,6 +59,16 @@ Requests enter a priority heap; the dispatch loop drains it in priority order, w
 Priority defaults to the value given at `register_robot()` and can be raised for a single request with `submit(robot_id, request, priority_override=0)`. The intent is that a safety-critical action — a stop, a reflex, an obstacle response — reaches the backbone ahead of routine manipulation traffic already queued in front of it, even when the fleet is saturated.
 
 `submit()` raises `KeyError` for an unregistered robot id, so a request for a robot that was deregistered mid-run fails at submission rather than being queued and silently discarded later.
+
+## Head batching
+
+Measured on π0.5 (BENCHMARKS.md, V3 microbenchmark), the two stages behave very differently under batching. The PaliGemma prefix is compute-bound: 1 / 2 / 4 rows take 66 / 123 / 240 ms, so batching it gains about 10% throughput while every robot waits for the whole batch. The action expert's ten Euler steps are launch-bound: 1 / 2 / 4 / 8 rows take 94 / 99 / 101 / 127 ms, so four robots' heads cost about one (ADR-022).
+
+Encoded requests therefore wait in a ready list, and the head stage runs every ready row whose head can batch with the others in one `predict_batch` call. Nothing waits for a batch to fill. The loop keeps encoding only while the next queued request's head would join the same batch; otherwise the ready rows run at once — a batch of one under light load. Each chunk carries `metadata["head_batch_size"]`.
+
+Batching is opt-in per head, through the `BatchedActionHead` Protocol (`vla_runtime/action_head/base.py`): rows are batched only across instances that share weights (`shares_weights_with`) and all implement it. Every row keeps its own noise, condition, state, RTC context and output, and one instance serves the whole batch, so the call may keep no per-robot state. Heads without the Protocol run their own `predict()` as soon as their condition is ready, unchanged. The LeRobot prefix-KV heads (SmolVLA, π0.5) implement it; prefixes of different lengths are right-padded and masked.
+
+Batched rows are not bit-identical to the same row run alone: under bf16 the larger GEMMs pick different kernels, and π0.5 actions move by up to about 1e-2 (mean about 3e-4) at a scale of 1. Within one batched pass, a repeated row is bit-identical and masked padding changes nothing (`benchmarks/benchmark_sim.py`). Closed-loop success is the acceptance test.
 
 ## Back-pressure
 
@@ -82,11 +93,13 @@ except SomeBackendError:
     hold_position("arm_left")   # other robots are unaffected
 ```
 
+A failed `predict_batch` emits `fleet_head_batch_fallback` and retries every row with its own `predict()`, so one bad row fails only its own request.
+
 `asyncio.CancelledError` is excluded from this containment: the handle is released and the cancellation propagates normally, since a cancelled fleet is being shut down rather than recovering.
 
 ## Introspection
 
-`stats()` returns registered robots, queue depth, running state, and a per-robot view carrying priority, stale frame count, and latency percentiles. Since backbone contention is the thing that goes wrong at scale, queue depth alongside per-robot latency percentiles is usually the pair that identifies whether the fleet is oversubscribed or a single robot is misbehaving.
+`stats()` returns registered robots, queue depth, running state, head calls with their mean batch size, and a per-robot view carrying priority, stale frame count, and latency percentiles. Since backbone contention is the thing that goes wrong at scale, queue depth alongside per-robot latency percentiles is usually the pair that identifies whether the fleet is oversubscribed or a single robot is misbehaving.
 
 ## Related documents
 
