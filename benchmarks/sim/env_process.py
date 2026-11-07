@@ -50,6 +50,9 @@ def _unpack(obs: Observation) -> Observation:
 
 def _serve(conn: Connection, factory: Callable[[], BenchEnv]) -> None:
     """Child process: build the env, then answer (method, args) until close."""
+    # One intra-op thread: every child defaults to one per core, and from five
+    # LIBERO envs on a 56-core host they oversubscribe it (step 23 -> 251 ms).
+    torch.set_num_threads(1)
     try:
         env = factory()
     except BaseException:  # noqa: BLE001 - reported to the parent, which raises
