@@ -21,6 +21,12 @@ captured once per batch size and replayed (``benchmarks/sim/cuda_graph.py``).
 The expert is launch-bound, so this cuts the 10-step loop from 89 to 33 ms at
 batch 1 with bit-identical output. RTC-guided calls stay eager.
 
+bf16 vision (``--policy-opt vision_bf16=1``): LeRobot keeps SigLIP and the
+projector in fp32 so training never toggles dtypes; at inference that is a
+third of the prefix's GPU time in fp32 GEMMs. bf16 weights take the prefix
+from 67 to 51 ms; actions move by up to ~6e-3, so it is accepted on closed-loop
+success (CLAUDE.md principle 3 allows the VLM lower precision, not the head).
+
 Built against LeRobot 0.6 (``lerobot.policies.common`` helpers, transformers
 ``DynamicCache``). It relies on these internals, all used verbatim by
 ``sample_actions``: ``PI05Policy._preprocess_images``, ``model.embed_prefix``,
@@ -40,11 +46,13 @@ Policy options (``--policy-opt key=value``):
                      ``google/paligemma-3b-pt-224``, for offline hosts
     rtc, rtc_beta, rtc_schedule, rtc_jacobian   as for smolvla
     cuda_graph       1 replays the unguided expert loop from CUDA Graphs (default 0)
+    vision_bf16      1 runs SigLIP and the projector in bf16 instead of fp32 (default 0)
 """
 
 from __future__ import annotations
 
 import functools
+import types
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -64,6 +72,7 @@ from benchmarks.sim.lerobot_smolvla import (
     parse_camera_map,
     pop_rtc_options,
     stack_prefix_kv,
+    wait_for_gpu,
     wrap_prefix_kv_policy,
 )
 from benchmarks.sim.policies import BenchPolicy
@@ -114,6 +123,7 @@ class PI05Model:
         tokenizer: Local PaliGemma tokenizer directory; None keeps the
             checkpoint's tokenizer id.
         cuda_graph: Replay the unguided expert loop from CUDA Graphs (V4).
+        vision_bf16: Run the vision tower and projector in bf16.
     """
 
     def __init__(
@@ -123,6 +133,7 @@ class PI05Model:
         camera_map: Mapping[str, str],
         tokenizer: str | None = None,
         cuda_graph: bool = False,
+        vision_bf16: bool = False,
     ) -> None:
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import make_pre_post_processors
@@ -148,6 +159,9 @@ class PI05Model:
         self.policy.eval()
         # Inference only; RTC's VJP must not build graphs for the weights.
         self.policy.requires_grad_(False)
+        self.vision_bf16 = vision_bf16
+        if vision_bf16:
+            _vision_to_bf16(self.policy.model.paligemma_with_expert)
         self.config = self.policy.config
         self.pre, self.post = make_pre_post_processors(
             self.policy.config,
@@ -369,8 +383,31 @@ class PI05Model:
         return self._postprocess(actions)[0]
 
     def _postprocess(self, actions: torch.Tensor) -> list[torch.Tensor]:
+        wait_for_gpu(actions)
         out = self.post(actions)
         return list(out.float().cpu().unbind(0))
+
+
+def _vision_to_bf16(paligemma_with_expert: Any) -> None:
+    """Cast SigLIP + projector to bf16 and feed them bf16 images.
+
+    ``PaliGemmaWithExpertModel.embed_image`` casts every image to fp32 for the
+    fp32 tower; this instance's replacement casts to bf16 and returns the
+    features in the caller's dtype, as the original does.
+    """
+    model = paligemma_with_expert.paligemma.model
+    model.vision_tower.to(torch.bfloat16)
+    model.multi_modal_projector.to(torch.bfloat16)
+
+    def embed_image(self: Any, image: torch.Tensor) -> torch.Tensor:
+        features = self.paligemma.model.get_image_features(image.to(torch.bfloat16))
+        return features.pooler_output.to(image.dtype)
+
+    paligemma_with_expert.embed_image = types.MethodType(embed_image, paligemma_with_expert)
+
+
+def _flag(opts: dict[str, str], key: str) -> bool:
+    return opts.pop(key, "0").lower() in ("1", "true", "yes")
 
 
 def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
@@ -383,12 +420,15 @@ def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
     vlm_budget_ms = float(opts.pop("vlm_budget_ms", "2000"))
     tokenizer = opts.pop("tokenizer", None)
     rtc, rtc_config = pop_rtc_options(opts)
-    cuda_graph = opts.pop("cuda_graph", "0").lower() in ("1", "true", "yes")
+    cuda_graph = _flag(opts, "cuda_graph")
+    vision_bf16 = _flag(opts, "vision_bf16")
     if opts:
         raise ValueError(f"unknown --policy-opt for pi05: {sorted(opts)}")
     check_cameras(cameras, spec)
 
-    model = PI05Model(repo, device, cameras, tokenizer=tokenizer, cuda_graph=cuda_graph)
+    model = PI05Model(
+        repo, device, cameras, tokenizer=tokenizer, cuda_graph=cuda_graph, vision_bf16=vision_bf16
+    )
     return wrap_prefix_kv_policy(
         model,
         spec,
@@ -396,5 +436,10 @@ def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
         rtc=rtc,
         rtc_config=rtc_config,
         n_action_steps=int(n_action_steps) if n_action_steps else None,
-        info={"device": str(device), "cameras": cameras, "cuda_graph": cuda_graph},
+        info={
+            "device": str(device),
+            "cameras": cameras,
+            "cuda_graph": cuda_graph,
+            "vision_bf16": vision_bf16,
+        },
     )
