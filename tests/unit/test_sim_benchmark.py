@@ -287,11 +287,14 @@ class TestCli:
         assert config.label.endswith("/adaptive400ms")
 
     def test_realtime_follows_the_fleet_advised_threshold(self):
-        # Any measured round exceeds a 1 us target, so the fleet advises 0.5 throughout.
+        # Any measured round exceeds a 1 us target: once past the dropped first samples
+        # the fleet advises 0.5 and keeps it.
         records, wall_s = _run("realtime", num_robots=2, max_steps=20, chunk_threshold=0.9,
                                adaptive_target_ms=0.001)
-        assert all(r.replan_threshold and set(r.replan_threshold) == {0.5} for r in records)
-        assert summarize(records, wall_s)["replan_threshold_mean"] == 0.5
+        for r in records:
+            assert r.replan_threshold and r.replan_threshold[-1] == 0.5
+            assert set(r.replan_threshold) <= {0.9, 0.5}
+        assert summarize(records, wall_s)["replan_threshold_mean"] < 0.9
         fixed, _ = _run("realtime", num_robots=1, max_steps=20)
         assert all(not r.replan_threshold for r in fixed)
 

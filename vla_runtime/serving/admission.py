@@ -47,6 +47,10 @@ class AdmissionConfig:
         admit_latency_ms: Refuse a registration whose predicted round would
             exceed this; None admits up to ``FleetConfig.max_robots``.
         ewma_alpha: Weight of each new stage-latency sample.
+        skip_first: Samples dropped per stage and head batch size before
+            estimating: the first call at a new batch size captures its CUDA
+            Graph (V3: ~700 ms against ~155 ms warm), which would hold the
+            estimate over target for several rounds.
     """
 
     latency_target_ms: float
@@ -55,6 +59,7 @@ class AdmissionConfig:
     hysteresis: float = 0.1
     admit_latency_ms: float | None = None
     ewma_alpha: float = 0.2
+    skip_first: int = 1
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.relaxed_threshold <= self.fresh_threshold <= 1.0:
@@ -66,6 +71,8 @@ class AdmissionConfig:
             raise ValueError(f"hysteresis must be in [0, 1), got {self.hysteresis}")
         if not 0.0 < self.ewma_alpha <= 1.0:
             raise ValueError(f"ewma_alpha must be in (0, 1], got {self.ewma_alpha}")
+        if self.skip_first < 0:
+            raise ValueError(f"skip_first must be >= 0, got {self.skip_first}")
 
 
 @dataclass
@@ -87,6 +94,7 @@ class AdmissionController:
     level: AdmissionLevel = field(default="fresh", init=False)
     vlm_ms: float | None = field(default=None, init=False)
     head_ms: dict[int, float] = field(default_factory=dict, init=False)
+    _seen: dict[str | int, int] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def threshold(self) -> float:
@@ -95,10 +103,12 @@ class AdmissionController:
         return self.config.relaxed_threshold
 
     def record_vlm(self, ms: float) -> None:
-        self.vlm_ms = self._ewma(self.vlm_ms, ms)
+        if self._warm("vlm"):
+            self.vlm_ms = self._ewma(self.vlm_ms, ms)
 
     def record_head(self, batch_size: int, ms: float) -> None:
-        self.head_ms[batch_size] = self._ewma(self.head_ms.get(batch_size), ms)
+        if self._warm(batch_size):
+            self.head_ms[batch_size] = self._ewma(self.head_ms.get(batch_size), ms)
 
     def head_estimate(self, batch_size: int) -> float | None:
         """Head cost at ``batch_size``: measured, else a line through the measured sizes.
@@ -161,6 +171,12 @@ class AdmissionController:
             "vlm_ms": None if self.vlm_ms is None else round(self.vlm_ms, 2),
             "head_ms": {b: round(ms, 2) for b, ms in sorted(self.head_ms.items())},
         }
+
+    def _warm(self, key: str | int) -> bool:
+        """Count a sample for ``key``; False while it is among the first ``skip_first``."""
+        seen = self._seen.get(key, 0)
+        self._seen[key] = seen + 1
+        return seen >= self.config.skip_first
 
     def _ewma(self, current: float | None, sample: float) -> float:
         if current is None:

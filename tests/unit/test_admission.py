@@ -30,7 +30,9 @@ CAPS = decoupled_caps(condition_kind="prefix_tokens")
 
 
 def _controller(**kwargs) -> AdmissionController:
-    return AdmissionController(AdmissionConfig(**{"latency_target_ms": 300.0, **kwargs}))
+    return AdmissionController(
+        AdmissionConfig(**{"latency_target_ms": 300.0, "skip_first": 0, **kwargs})
+    )
 
 
 # ── Controller ────────────────────────────────────────────────────────────────
@@ -71,6 +73,16 @@ def test_stage_costs_are_smoothed():
     assert c.vlm_ms == pytest.approx(50.0)
 
 
+def test_first_sample_per_stage_and_batch_size_is_dropped():
+    c = _controller(skip_first=1)
+    c.record_vlm(700.0)  # cold start
+    c.record_vlm(50.0)
+    c.record_head(2, 650.0)  # CUDA Graph capture at a new batch size
+    c.record_head(2, 52.0)
+    c.record_head(4, 600.0)
+    assert c.vlm_ms == 50.0 and c.head_ms == {2: 52.0}
+
+
 def test_level_relaxes_over_target_and_recovers_below_hysteresis():
     c = _controller(hysteresis=0.1)
     c.record_vlm(50.0)
@@ -107,6 +119,7 @@ def test_without_limit_every_robot_is_admitted():
         {"fresh_threshold": 0.4, "relaxed_threshold": 0.5},
         {"hysteresis": 1.0},
         {"ewma_alpha": 0.0},
+        {"skip_first": -1},
     ],
 )
 def test_invalid_config_rejected(kwargs):
@@ -162,7 +175,7 @@ def _run(coro):
 def test_fleet_chunks_carry_the_advised_threshold():
     async def run():
         # A 20 ms VLM against a 1 ms target: over target from the first chunk.
-        admission = AdmissionConfig(latency_target_ms=1.0, fresh_threshold=0.9)
+        admission = AdmissionConfig(latency_target_ms=1.0, fresh_threshold=0.9, skip_first=0)
         fleet = FleetScheduler(
             _SlowVLM(0.02), CAPS, FleetConfig(max_robots=2, admission=admission)
         )
@@ -184,7 +197,9 @@ def test_fleet_chunks_carry_the_advised_threshold():
 
 def test_fleet_refuses_a_robot_past_the_admission_limit():
     async def run():
-        admission = AdmissionConfig(latency_target_ms=1000.0, admit_latency_ms=30.0)
+        admission = AdmissionConfig(
+            latency_target_ms=1000.0, admit_latency_ms=30.0, skip_first=0
+        )
         fleet = FleetScheduler(
             _SlowVLM(0.02), CAPS, FleetConfig(max_robots=4, admission=admission)
         )
