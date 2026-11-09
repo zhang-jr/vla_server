@@ -367,8 +367,20 @@ class SmolVLAModel:
         return self._postprocess(actions)[0]
 
     def _postprocess(self, actions: torch.Tensor) -> list[torch.Tensor]:
+        wait_for_gpu(actions)
         out = self.post(actions)
         return list(out.float().cpu().unbind(0))
+
+
+def wait_for_gpu(tensor: torch.Tensor) -> None:
+    """Block until ``tensor``'s stream is done, with the GIL released.
+
+    A blocking device-to-host copy waits for the GPU while holding the GIL:
+    a graphed expert pass would stall every other Python thread (the VLM
+    stage, env workers, the event loop) for its whole 33-72 ms.
+    """
+    if tensor.is_cuda:
+        torch.cuda.current_stream(tensor.device).synchronize()
 
 
 def stack_prefix_kv(
