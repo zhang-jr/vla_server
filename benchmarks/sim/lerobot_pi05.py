@@ -27,6 +27,13 @@ third of the prefix's GPU time in fp32 GEMMs. bf16 weights take the prefix
 from 67 to 51 ms; actions move by up to ~6e-3, so it is accepted on closed-loop
 success (CLAUDE.md principle 3 allows the VLM lower precision, not the head).
 
+Expert sdpa (``--policy-opt expert_sdpa=N``): ``denoise_step`` pins the expert
+to eager attention, whose ``repeat_kv`` and elementwise softmax are about a
+quarter of a graphed batch-4 pass. From batch N on the expert runs sdpa with a
+boolean mask instead (graphed B=4 72 -> 51 ms, B=8 109 -> 70 ms); below N it
+stays eager, which is faster at batch 1. sdpa reorders the softmax, so actions
+move by ~5e-3 and the option is accepted on closed-loop success.
+
 Built against LeRobot 0.6 (``lerobot.policies.common`` helpers, transformers
 ``DynamicCache``). It relies on these internals, all used verbatim by
 ``sample_actions``: ``PI05Policy._preprocess_images``, ``model.embed_prefix``,
@@ -47,6 +54,7 @@ Policy options (``--policy-opt key=value``):
     rtc, rtc_beta, rtc_schedule, rtc_jacobian   as for smolvla
     cuda_graph       1 replays the unguided expert loop from CUDA Graphs (default 0)
     vision_bf16      1 runs SigLIP and the projector in bf16 instead of fp32 (default 0)
+    expert_sdpa      batch size from which the expert uses sdpa attention (default 0: never)
 """
 
 from __future__ import annotations
@@ -124,6 +132,8 @@ class PI05Model:
             checkpoint's tokenizer id.
         cuda_graph: Replay the unguided expert loop from CUDA Graphs (V4).
         vision_bf16: Run the vision tower and projector in bf16.
+        expert_sdpa_min_batch: Batch size from which the expert attends with
+            sdpa instead of eager; None keeps eager throughout.
     """
 
     def __init__(
@@ -134,6 +144,7 @@ class PI05Model:
         tokenizer: str | None = None,
         cuda_graph: bool = False,
         vision_bf16: bool = False,
+        expert_sdpa_min_batch: int | None = None,
     ) -> None:
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import make_pre_post_processors
@@ -182,6 +193,7 @@ class PI05Model:
             dtype=self.policy.model.action_in_proj.weight.dtype,
             device=device,
         )
+        self.expert_sdpa_min_batch = expert_sdpa_min_batch
         self._graphs = GraphCache(self._graph_loop) if cuda_graph else None
 
     @property
@@ -295,9 +307,17 @@ class PI05Model:
             dim=2,
         )
         position_ids = torch.sum(pad_masks, dim=-1)[:, None] + torch.cumsum(suffix_pad, dim=1) - 1
-        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
+        # The choice depends only on the batch size, so each captured graph has one.
+        sdpa = self.expert_sdpa_min_batch is not None and batch_size >= self.expert_sdpa_min_batch
+        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
+            "sdpa" if sdpa else "eager"
+        )
+        # sdpa rejects the fp32 additive mask eager takes; it reads the boolean one.
+        attention_mask = (
+            full_att_2d[:, None] if sdpa else self._prepare_attention_masks_4d(full_att_2d)
+        )
         outputs, _ = model.paligemma_with_expert.forward(
-            attention_mask=self._prepare_attention_masks_4d(full_att_2d),
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=_prefix_cache_type()(layers),
             inputs_embeds=[None, action_emb],
@@ -422,12 +442,19 @@ def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
     rtc, rtc_config = pop_rtc_options(opts)
     cuda_graph = _flag(opts, "cuda_graph")
     vision_bf16 = _flag(opts, "vision_bf16")
+    expert_sdpa = int(opts.pop("expert_sdpa", "0"))
     if opts:
         raise ValueError(f"unknown --policy-opt for pi05: {sorted(opts)}")
     check_cameras(cameras, spec)
 
     model = PI05Model(
-        repo, device, cameras, tokenizer=tokenizer, cuda_graph=cuda_graph, vision_bf16=vision_bf16
+        repo,
+        device,
+        cameras,
+        tokenizer=tokenizer,
+        cuda_graph=cuda_graph,
+        vision_bf16=vision_bf16,
+        expert_sdpa_min_batch=expert_sdpa or None,
     )
     return wrap_prefix_kv_policy(
         model,
@@ -441,5 +468,6 @@ def build_pi05(spec: EnvSpec, options: dict[str, str]) -> BenchPolicy:
             "cameras": cameras,
             "cuda_graph": cuda_graph,
             "vision_bf16": vision_bf16,
+            "expert_sdpa": expert_sdpa,
         },
     )

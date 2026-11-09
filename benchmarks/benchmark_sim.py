@@ -13,7 +13,9 @@ What must hold before any LIBERO / ManiSkill number goes into BENCHMARKS.md:
      batching) matches each row denoised alone with the same noise, including
      RTC rows mixed with unguided ones and right-padded prefixes.
      The π0.5 expert replayed from CUDA Graphs (V4) equals the eager loop bit
-     for bit, and its capturable step equals LeRobot's ``denoise_step``.
+     for bit, and its capturable step equals LeRobot's ``denoise_step``. The
+     expert's sdpa attention stays within bf16 noise of eager, and leaves
+     batches below its threshold untouched.
   4. Each simulator wrapper produces the observation format the policies read.
   5. One short episode per mode runs end to end on LIBERO.
 
@@ -339,6 +341,24 @@ def test_pi05_cuda_graph_matches_eager(pi05_model):
             assert torch.equal(g, w)
 
 
+def test_pi05_expert_sdpa_close_to_eager(pi05_model):
+    """sdpa from batch 2: batch 1 stays bit-identical, batch 3 within bf16 noise."""
+    model = pi05_model
+    rows, noise = _pi05_rows(model)
+    eager = model.denoise_batch(rows, noise=noise.clone())
+    eager_single = model.denoise(rows[0], noise=noise[:1].clone())
+    model.expert_sdpa_min_batch = 2
+    try:
+        sdpa = model.denoise_batch(rows, noise=noise.clone())
+        sdpa_single = model.denoise(rows[0], noise=noise[:1].clone())
+    finally:
+        model.expert_sdpa_min_batch = None
+    assert torch.equal(sdpa_single, eager_single)
+    for s, e in zip(sdpa, eager, strict=True):
+        assert (s - e).abs().max() < 5e-2
+        assert not torch.equal(s, e)
+
+
 def test_pi05_cuda_graph_head_latency(pi05_model, record_property):
     """V4: expert loop P50, eager vs CUDA Graph, per batch size."""
     from benchmarks.sim.cuda_graph import GraphCache
@@ -368,8 +388,13 @@ def test_pi05_cuda_graph_head_latency(pi05_model, record_property):
     try:
         for batch in (1, 2, 4, 8):
             results[f"graph_b{batch}"] = timed(batch)
+        model._graphs = GraphCache(model._graph_loop)
+        model.expert_sdpa_min_batch = 2
+        for batch in (2, 4, 8):
+            results[f"graph_sdpa_b{batch}"] = timed(batch)
     finally:
         model._graphs = None
+        model.expert_sdpa_min_batch = None
     for key, ms in results.items():
         record_property(f"head_p50_ms_{key}", round(ms, 2))
     print(f"\npi05 expert P50 (ms): {results}")
