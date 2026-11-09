@@ -54,6 +54,7 @@ from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.scheduler.async_scheduler import AsyncScheduler, RequestHandle
 from vla_runtime.scheduler.budget_manager import BudgetConfig
 from vla_runtime.scheduler.chunk_buffer import ChunkBlendPolicy, ChunkBuffer
+from vla_runtime.serving.admission import AdmissionConfig
 from vla_runtime.serving.fleet import FleetConfig, FleetScheduler
 from vla_runtime.vlm.base import ActionRequest
 
@@ -86,6 +87,10 @@ class RunConfig:
             this process, which contend with inference for the GIL).
         head_batch: realtime — most robots per fleet head call (ADR-022);
             1 runs every request's head on its own.
+        adaptive_target_ms: realtime — fleet admission control (ADR-023):
+            above this predicted round latency robots replan at
+            ``relaxed_threshold`` instead of ``chunk_threshold``. None = fixed.
+        relaxed_threshold: realtime — the threshold admission control falls back to.
         max_steps: Override every task's step limit.
         warmup: Untimed inferences before the first episode.
     """
@@ -104,6 +109,8 @@ class RunConfig:
     num_robots: int = 1
     env_process: bool = True
     head_batch: int = FleetConfig.max_head_batch
+    adaptive_target_ms: float | None = None
+    relaxed_threshold: float = 0.5
     max_steps: int | None = None
     warmup: int = 3
 
@@ -122,6 +129,8 @@ class RunConfig:
                 parts.append("thread-env")
             if self.head_batch != FleetConfig.max_head_batch:
                 parts.append(f"hb{self.head_batch}")
+            if self.adaptive_target_ms is not None:
+                parts.append(f"adaptive{self.adaptive_target_ms:g}ms")
         return "/".join(parts)
 
 
@@ -414,6 +423,8 @@ async def _realtime_episode(
     loop = asyncio.get_running_loop()
     period = 1.0 / spec.control_hz
     rtc = bench.policy.capabilities.supports_rtc
+    # The fleet's advice (ADR-023) once it has given any; the configured value before.
+    threshold = config.chunk_threshold
     frame = 0
 
     async def infer(obs: Observation) -> tuple[ActionChunk | None, float, str | None]:
@@ -426,6 +437,8 @@ async def _realtime_episode(
         _raise_if_failed(handle)
         if chunk is not None:
             record.head_batch.append(int(chunk.metadata.get("head_batch_size", 1)))
+            if "replan_threshold" in chunk.metadata:
+                record.replan_threshold.append(float(chunk.metadata["replan_threshold"]))
         return chunk, (time.perf_counter() - t0) * 1000.0, handle.degraded
 
     # A fresh registration per episode: no condition survives from the last one.
@@ -441,6 +454,7 @@ async def _realtime_episode(
         record.inference_ms.append(elapsed_ms)
         record.blocked_ms += elapsed_ms
         buffer.push(first)
+        threshold = float(first.metadata.get("replan_threshold", threshold))
 
         executed: list[torch.Tensor] = []
         boundaries = [0]
@@ -459,7 +473,8 @@ async def _realtime_episode(
                     buffer.update_latency_trim(elapsed_ms)
                     buffer.push(chunk)
                     boundaries.append(step)
-            if in_flight is None and _needs_chunk(buffer, chunk_size, config.chunk_threshold):
+                    threshold = float(chunk.metadata.get("replan_threshold", threshold))
+            if in_flight is None and _needs_chunk(buffer, chunk_size, threshold):
                 in_flight = asyncio.create_task(infer(obs))
 
             action = buffer.next_action()
@@ -589,6 +604,15 @@ async def run_benchmark(
                     vlm_budget_ms=config.vlm_budget_ms,
                     action_head_budget_ms=config.head_budget_ms,
                     max_head_batch=config.head_batch,
+                    admission=(
+                        AdmissionConfig(
+                            latency_target_ms=config.adaptive_target_ms,
+                            fresh_threshold=config.chunk_threshold,
+                            relaxed_threshold=config.relaxed_threshold,
+                        )
+                        if config.adaptive_target_ms is not None
+                        else None
+                    ),
                 ),
             )
             await fleet.start()

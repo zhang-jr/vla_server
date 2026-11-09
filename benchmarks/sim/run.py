@@ -140,7 +140,9 @@ def build_configs(args: argparse.Namespace) -> list[RunConfig]:
             configs += [
                 replace(base, mode=mode, blend_policy=b, num_robots=n,
                         env_process=args.realtime_env == "process",
-                        head_batch=args.head_batch)
+                        head_batch=args.head_batch,
+                        adaptive_target_ms=args.adaptive_target_ms,
+                        relaxed_threshold=args.relaxed_threshold)
                 for b in blends
                 for n in robots
             ]
@@ -249,6 +251,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--robots", default="1", help="realtime sweep of fleet sizes, e.g. 1,2,4")
     parser.add_argument("--head-batch", type=int, default=RunConfig.head_batch,
                         help="realtime: most robots per fleet head call (ADR-022); 1 = serial")
+    parser.add_argument("--adaptive-target-ms", type=float, default=None,
+                        help="realtime: fleet admission control (ADR-023) - above this predicted "
+                             "round latency robots replan at --relaxed-threshold")
+    parser.add_argument("--relaxed-threshold", type=float, default=RunConfig.relaxed_threshold,
+                        help="realtime: replan threshold under admission control's relaxed level")
     parser.add_argument("--realtime-env", choices=("process", "thread"), default="process",
                         help="realtime: one process per robot env (default), or threads of the "
                              "server process (contend with inference for the GIL)")

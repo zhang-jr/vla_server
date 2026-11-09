@@ -279,6 +279,22 @@ class TestCli:
         assert all(r.head_batch and set(r.head_batch) == {1} for r in records)  # mock head: no batching
         assert summarize(records, wall_s)["head_batch_mean"] == 1.0
 
+    def test_adaptive_threshold_flags(self):
+        args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "realtime",
+                           "--adaptive-target-ms", "400", "--relaxed-threshold", "0.4"])
+        (config,) = build_configs(args)
+        assert config.adaptive_target_ms == 400.0 and config.relaxed_threshold == 0.4
+        assert config.label.endswith("/adaptive400ms")
+
+    def test_realtime_follows_the_fleet_advised_threshold(self):
+        # Any measured round exceeds a 1 us target, so the fleet advises 0.5 throughout.
+        records, wall_s = _run("realtime", num_robots=2, max_steps=20, chunk_threshold=0.9,
+                               adaptive_target_ms=0.001)
+        assert all(r.replan_threshold and set(r.replan_threshold) == {0.5} for r in records)
+        assert summarize(records, wall_s)["replan_threshold_mean"] == 0.5
+        fixed, _ = _run("realtime", num_robots=1, max_steps=20)
+        assert all(not r.replan_threshold for r in fixed)
+
     def test_unknown_mode_rejected(self):
         args = parse_args(["--env", "mock", "--policy", "mock", "--modes", "turbo"])
         with pytest.raises(SystemExit):
