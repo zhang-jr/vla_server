@@ -12,6 +12,8 @@ What must hold before any LIBERO / ManiSkill number goes into BENCHMARKS.md:
   3. A batched expert pass over several robots' conditions (ADR-022, fleet head
      batching) matches each row denoised alone with the same noise, including
      RTC rows mixed with unguided ones and right-padded prefixes.
+     The π0.5 expert replayed from CUDA Graphs (V4) equals the eager loop bit
+     for bit, and its capturable step equals LeRobot's ``denoise_step``.
   4. Each simulator wrapper produces the observation format the policies read.
   5. One short episode per mode runs end to end on LIBERO.
 
@@ -280,6 +282,98 @@ def test_smolvla_batched_head_matches_rows(smolvla_model):
 
 def test_pi05_batched_head_matches_rows(pi05_model):
     _check_batched_head_matches_rows(pi05_model)
+
+
+def _pi05_rows(model) -> tuple[list, torch.Tensor]:
+    """Three rows over two conditions, and their noise."""
+    images, text, state = _synthetic_obs()
+    first = model.encode_prefix(images, text, state)
+    second = model.encode_prefix(
+        {k: v.flip(-1) for k, v in images.items()}, "open the top drawer", state + 0.05
+    )
+    config = model.config
+    noise = torch.randn(
+        3, config.chunk_size, config.max_action_dim, generator=torch.Generator().manual_seed(1)
+    ).to(model.device)
+    return [first, second, first], noise
+
+
+def test_pi05_velocity_matches_denoise_step(pi05_model):
+    """The capturable ``_velocity`` is LeRobot's ``denoise_step``, bit for bit."""
+    from transformers import DynamicCache
+
+    model = pi05_model
+    rows, noise = _pi05_rows(model)
+    with torch.inference_mode():
+        layers, pad_masks = model._prefix_layers(rows, clone=False)
+        cache = DynamicCache(tuple((key, value, None) for key, value in layers))
+        t = torch.full((len(rows),), 0.7, device=model.device)
+        ours = model._velocity(pad_masks, layers, noise, t)
+        ref = model.policy.model.denoise_step(pad_masks, cache, noise, t)
+    assert torch.equal(ours, ref)
+
+
+def test_pi05_cuda_graph_matches_eager(pi05_model):
+    """V4: graph replay == eager, bit for bit, on fresh inputs and per batch size."""
+    from benchmarks.sim.cuda_graph import GraphCache
+
+    model = pi05_model
+    rows, noise = _pi05_rows(model)
+    swapped = [rows[1], rows[0], rows[1]]
+    model._graphs = GraphCache(model._graph_loop)
+    try:
+        graphed = model.denoise_batch(rows, noise=noise.clone())
+        # Same shapes, new data: the captured graph must read its inputs.
+        replayed = model.denoise_batch(swapped, noise=noise.flip(0).clone())
+        single = model.denoise(rows[0], noise=noise[:1].clone())
+        num_graphs = model._graphs.num_graphs
+    finally:
+        model._graphs = None
+    assert num_graphs == 2
+    for got, want in (
+        (graphed, model.denoise_batch(rows, noise=noise.clone())),
+        (replayed, model.denoise_batch(swapped, noise=noise.flip(0).clone())),
+        ([single], [model.denoise(rows[0], noise=noise[:1].clone())]),
+    ):
+        for g, w in zip(got, want, strict=True):
+            assert torch.equal(g, w)
+
+
+def test_pi05_cuda_graph_head_latency(pi05_model, record_property):
+    """V4: expert loop P50, eager vs CUDA Graph, per batch size."""
+    from benchmarks.sim.cuda_graph import GraphCache
+
+    model = pi05_model
+    rows, _ = _pi05_rows(model)
+    config = model.config
+
+    def timed(batch: int) -> float:
+        conditions = [rows[0]] * batch
+        noise = torch.randn(batch, config.chunk_size, config.max_action_dim, device=model.device)
+        for _ in range(3):
+            model.denoise_batch(conditions, noise=noise)
+        samples = []
+        for _ in range(10):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.denoise_batch(conditions, noise=noise)
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        return sorted(samples)[len(samples) // 2]
+
+    results = {}
+    for batch in (1, 2, 4, 8):
+        results[f"eager_b{batch}"] = timed(batch)
+    model._graphs = GraphCache(model._graph_loop)
+    try:
+        for batch in (1, 2, 4, 8):
+            results[f"graph_b{batch}"] = timed(batch)
+    finally:
+        model._graphs = None
+    for key, ms in results.items():
+        record_property(f"head_p50_ms_{key}", round(ms, 2))
+    print(f"\npi05 expert P50 (ms): {results}")
+    assert results["graph_b1"] < 0.7 * results["eager_b1"]
 
 
 def _rtc_head_latency(model, record_property, label: str) -> None:

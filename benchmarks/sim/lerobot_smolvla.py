@@ -487,7 +487,8 @@ def euler_denoise(
     x_t = noise
     for step in range(num_steps):
         time = 1.0 + step * dt
-        step_time = torch.tensor(time, dtype=torch.float32, device=device).expand(noise.shape[0])
+        # A fill, not a host copy: the unguided loop must be CUDA Graph capturable.
+        step_time = torch.full((noise.shape[0],), time, dtype=torch.float32, device=device)
         if guidance is None:
             v_t = velocity_fn(x_t, step_time)
         else:
