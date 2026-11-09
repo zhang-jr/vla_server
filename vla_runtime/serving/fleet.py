@@ -38,6 +38,12 @@ Queue design:
       rows run at once, a batch of one under light load. Other heads run
       their own predict() as soon as their condition is ready.
 
+Admission control (ADR-023, ``FleetConfig.admission``): from the measured
+stage costs the fleet predicts its round latency for the registered robots,
+tells every robot the replan threshold that load calls for (chunk metadata
+``replan_threshold``), and can refuse a robot whose arrival would push the
+prediction past a hard limit. See ``vla_runtime/serving/admission.py``.
+
 Usage::
 
     fleet = FleetScheduler(
@@ -77,6 +83,7 @@ from vla_runtime.action_head.base import (
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import (
     ActionHeadFailureError,
+    BudgetExceededError,
     EdgeResourceError,
     EmbeddingStaleError,
     ErrorContext,
@@ -87,6 +94,7 @@ from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.scheduler.async_scheduler import RequestHandle
 from vla_runtime.scheduler.budget_manager import BudgetConfig, BudgetManager
+from vla_runtime.serving.admission import AdmissionConfig, AdmissionController
 from vla_runtime.vlm.base import ActionRequest, Embedding, VLMBackend
 
 if TYPE_CHECKING:
@@ -111,6 +119,8 @@ class FleetConfig:
         action_head_budget_ms: Per-request action head latency budget.
         max_head_batch: Most rows in one predict_batch call (ADR-022); 1
             disables head batching and restores encode → head per request.
+        admission: Load-adaptive replan threshold and admission (ADR-023);
+            None leaves both to the clients and ``max_robots``.
 
     How long a reused condition stays usable is not configured here: it is the
     policy's calibrated PolicyCapabilities.max_condition_staleness_ms.
@@ -122,6 +132,7 @@ class FleetConfig:
     vlm_budget_ms: float = 200.0
     action_head_budget_ms: float = 50.0
     max_head_batch: int = 8
+    admission: Optional[AdmissionConfig] = None
 
     def __post_init__(self) -> None:
         if self.max_head_batch < 1:
@@ -226,6 +237,10 @@ class FleetScheduler:
         self._head_calls = 0
         self._head_rows = 0
 
+        self._admission = (
+            AdmissionController(self._config.admission) if self._config.admission else None
+        )
+
     @classmethod
     def from_policy(
         cls,
@@ -298,6 +313,8 @@ class FleetScheduler:
                 is already registered for another robot, or no head was given
                 on a fleet without a policy.
             EdgeResourceError: If max_robots would be exceeded.
+            BudgetExceededError: If admission control predicts the fleet's
+                round latency with this robot above ``admit_latency_ms``.
             PolicyCapabilityError: If the policy declares supports_rtc and the
                 head does not implement RealTimeChunkingHead.
         """
@@ -336,6 +353,7 @@ class FleetScheduler:
                         request_id=robot_id,
                     ),
                 )
+            self._check_admission(robot_id, len(self._robots) + 1)
             self._robots[robot_id] = RobotSlot(
                 robot_id=robot_id,
                 action_head=action_head,
@@ -343,6 +361,7 @@ class FleetScheduler:
             )
         _metrics.gauge("fleet_registered_robots", len(self._robots))
         _tracer.event("robot_registered", robot_id=robot_id, priority=priority)
+        self._update_admission()
 
     async def deregister_robot(self, robot_id: str) -> None:
         """Remove a robot from the fleet.
@@ -356,6 +375,54 @@ class FleetScheduler:
             self._robots.pop(robot_id, None)
         _metrics.gauge("fleet_registered_robots", len(self._robots))
         _tracer.event("robot_deregistered", robot_id=robot_id)
+        self._update_admission()
+
+    # ── Admission control (ADR-023) ───────────────────────────────────────────
+
+    @property
+    def replan_threshold(self) -> Optional[float]:
+        """The replan threshold admission control advises; None without admission."""
+        return None if self._admission is None else self._admission.threshold
+
+    def _check_admission(self, robot_id: str, num_robots: int) -> None:
+        if self._admission is None:
+            return
+        admitted, predicted = self._admission.admits(num_robots)
+        if admitted:
+            return
+        limit = self._admission.config.admit_latency_ms
+        _metrics.increment("fleet_admission_rejected")
+        _tracer.event(
+            "fleet_admission_rejected",
+            robot_id=robot_id,
+            num_robots=num_robots,
+            predicted_round_ms=round(predicted, 1),
+            admit_latency_ms=limit,
+        )
+        raise BudgetExceededError(
+            predicted,
+            limit,
+            ErrorContext(
+                trace_id=_tracer.trace_id, module_name="serving.fleet", request_id=robot_id
+            ),
+        )
+
+    def _update_admission(self) -> None:
+        if self._admission is None:
+            return
+        change = self._admission.update(len(self._robots))
+        if change is None:
+            return
+        _metrics.gauge("fleet_replan_threshold", change.threshold)
+        _tracer.event(
+            "fleet_admission_level",
+            level=change.level,
+            replan_threshold=change.threshold,
+            num_robots=change.num_robots,
+            predicted_round_ms=round(change.predicted_round_ms, 1),
+            vlm_ms=round(self._admission.vlm_ms or 0.0, 2),
+            head_ms=round(self._admission.head_estimate(change.num_robots) or 0.0, 2),
+        )
 
     # ── Request submission ────────────────────────────────────────────────────
 
@@ -624,6 +691,8 @@ class FleetScheduler:
 
         vlm_ms = (time.perf_counter() - t0) * 1000.0
         slot.budget_manager.record("vlm", vlm_ms, request_id=item.request.request_id)
+        if self._admission is not None and slot.stale_frames == 0:
+            self._admission.record_vlm(vlm_ms)
         _tracer.event(
             "fleet_vlm_encoded",
             robot_id=item.robot_id,
@@ -719,6 +788,8 @@ class FleetScheduler:
             return
         self._head_calls += 1
         self._head_rows += 1
+        if self._admission is not None:
+            self._admission.record_head(1, (time.perf_counter() - t0) * 1000.0)
         await self._deliver(entry, chunk, t0, batch_size=1)
 
     async def _predict_one(self, entry: _ReadyItem) -> ActionChunk:
@@ -782,11 +853,10 @@ class FleetScheduler:
             return
         self._head_calls += 1
         self._head_rows += len(group)
-        _tracer.event(
-            "fleet_head_batch",
-            batch_size=len(group),
-            head_ms=round((time.perf_counter() - t0) * 1000.0, 2),
-        )
+        head_ms = (time.perf_counter() - t0) * 1000.0
+        if self._admission is not None:
+            self._admission.record_head(len(group), head_ms)
+        _tracer.event("fleet_head_batch", batch_size=len(group), head_ms=round(head_ms, 2))
         for entry, chunk in zip(group, chunks):
             await self._deliver(entry, chunk, t0, batch_size=len(group))
 
@@ -801,6 +871,9 @@ class FleetScheduler:
             "action_head", action_ms, request_id=item.request.request_id
         )
         chunk.metadata = {**chunk.metadata, "head_batch_size": batch_size}
+        if self._admission is not None:
+            self._update_admission()
+            chunk.metadata["replan_threshold"] = self._admission.threshold
 
         await item.handle._chunk_queue.put(chunk)
         item.handle._done.set()
@@ -828,6 +901,7 @@ class FleetScheduler:
             "mean_head_batch": (
                 round(self._head_rows / self._head_calls, 3) if self._head_calls else None
             ),
+            "admission": None if self._admission is None else self._admission.snapshot(),
             "per_robot": {
                 rid: {
                     "priority": slot.priority,
