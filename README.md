@@ -47,22 +47,23 @@ Research prototype.
 
 | Model | Integration | State |
 |---|---|---|
-| π0.5 (LeRobot) | Split at the prefix-KV boundary, `benchmarks/sim/lerobot_pi05.py` | Matches native inference (1e-3); closed-loop LIBERO; fleet batching; CUDA Graph expert |
-| SmolVLA (LeRobot) | Split at the prefix-KV boundary, `benchmarks/sim/lerobot_smolvla.py` | Matches native inference; closed-loop LIBERO; fleet batching |
+| π0.5 (LeRobot) | Split at the prefix-KV boundary, `vla_runtime/models/pi05.py` | Matches native inference (1e-3); closed-loop LIBERO; fleet batching; CUDA Graph expert |
+| SmolVLA (LeRobot) | Split at the prefix-KV boundary, `vla_runtime/models/smolvla.py` | Matches native inference; closed-loop LIBERO; fleet batching |
 | OpenVLA, OpenVLA-OFT, π0 | Model-level latency benchmark only (`benchmarks/latency`) | Not integrated into the runtime |
 
-Not built yet:
-- a network endpoint in front of the fleet (an OpenPI-compatible WebSocket is planned);
-- a client-side chunk executor for real robots;
-- serving several models on one GPU.
+The policy server (`vla-serve`) puts the fleet behind a WebSocket endpoint that speaks openpi's wire protocol. openpi's own client drives it unmodified (tested with openpi-client 0.1.2 against the mock policy). It has not yet served a real model to a real robot: the ARX X5 benchmark still uses its own single-model server.
 
-The model adapters and CUDA Graph capture currently live under `benchmarks/sim/` and will move into the package.
+Not built yet:
+- a client-side chunk executor for real robots;
+- serving several models on one GPU;
+- serving models that cannot be split at the backbone → head boundary (OpenVLA-OFT, fused TensorRT pipelines).
 
 ## Design
 
 ```
-Application      ActionRequest (camera views + instruction + robot state)
-Serving          FleetScheduler: N robots over one loaded model, head batching, admission
+Application      robot client (openpi protocol) or in-process ActionRequest
+Serving          PolicyServer (WebSocket) → FleetScheduler: N robots over one loaded model,
+                 head batching, admission
 Pipeline         AsyncScheduler: one robot, encode → head → ChunkBuffer
 Module           VLMBackend | ActionHeadRuntime (+ PolicyCapabilities, Policy)
 Infra            RTC guidance | Observability | Precision policy
@@ -83,7 +84,24 @@ See [`docs/`](./docs/README.md) for the subsystems.
 pip install -e ".[dev]"
 python examples/minimal_pipeline.py    # mock backbone + reference head, CPU only
 python -m pytest                       # CPU unit tests
+vla-serve --policy mock --port 8000    # policy server with the mock policy
 ```
+
+Serving a real model to robots:
+
+```bash
+vla-serve --policy pi05 --policy-opt repo=<checkpoint> \
+    --policy-opt cuda_graph=1 --policy-opt vision_bf16=1 --policy-opt expert_sdpa=2 \
+    --image-key agentview=observation/image --image-key wrist=observation/wrist_image \
+    --max-robots 4
+```
+
+```python
+from openpi_client.websocket_client_policy import WebsocketClientPolicy
+actions = WebsocketClientPolicy(host="gpu-server", port=8000).infer(observation)["actions"]
+```
+
+See [`docs/serving-api.md`](./docs/serving-api.md) for the protocol.
 
 Closed-loop benchmarks need a CUDA host. In this repository, GPU work runs on a remote host through `scripts/remote.py`:
 

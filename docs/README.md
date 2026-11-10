@@ -29,7 +29,8 @@ LLM serving is a useful map of components, not of techniques: vLLM's gains come 
 
 ```
 Application     ActionRequest: camera views + instruction + robot state
-Serving         FleetScheduler — many robots over one loaded model, head batching, admission
+Serving         PolicyServer (WebSocket, openpi protocol) → FleetScheduler — many robots
+                over one loaded model, head batching, admission
 Pipeline        AsyncScheduler — one robot: encode -> head -> chunk buffer
 Module          VLMBackend  |  ActionHeadRuntime  (+ PolicyCapabilities, Policy)
 Infrastructure  RTC guidance  |  Observability  |  Precision policy
@@ -44,6 +45,7 @@ Infrastructure  RTC guidance  |  Observability  |  Precision policy
 | [Action heads](./action-heads.md) | The `ActionHeadRuntime` protocol, its optional capabilities, and the shipped heads |
 | [Scheduler](./scheduler.md) | `AsyncScheduler`, chunk stitching and latency compensation, and latency budgets |
 | [Fleet serving](./fleet-serving.md) | Serving many robots from one model with isolated per-robot state |
+| [Policy server](./serving-api.md) | The WebSocket endpoint (openpi wire protocol), its CLI, and the client's side |
 | [Quantization](./quantization.md) | Per-module precision policy and task-success-rate acceptance |
 | [Observability](./observability.md) | Structured tracing, metrics, and the error hierarchy |
 | [Benchmark methodology](./benchmark_methodology.md) | Closed-loop LIBERO / ManiSkill benchmarks: execution modes, metrics, and how to run them remotely |
@@ -60,6 +62,12 @@ vla_runtime/
                          RobotState, ActionChunk, conditioning checks
     flow_matching.py     Reference flow-matching head (MLP velocity net) for tests and mocks
     rtc.py               Real-Time Chunking guidance for any flow-matching expert
+    cuda_graph.py        GraphCache: capture a launch-bound loop once per shape, replay it
+  models/
+    prefix_kv.py         Prefix-KV backbone / expert head / policy, shared by the LeRobot models
+    smolvla.py, pi05.py  LeRobot SmolVLA and π0.5 adapters (LeRobot imported lazily)
+    registry.py          Load an adapter by name from key=value options
+    mock.py              CPU-only mock backbone + reference head
   scheduler/
     async_scheduler.py   Single-robot pipeline and degradation hooks
     chunk_buffer.py      Chunk stitching, latency trim, underrun tracking
@@ -67,6 +75,8 @@ vla_runtime/
   serving/
     fleet.py             Multi-robot scheduling over one model, head batching
     admission.py         Predicted round latency → advised replan threshold / admission
+    api_server.py        PolicyServer: WebSocket endpoint in front of the fleet, `vla-serve` CLI
+    wire.py              msgpack + numpy, byte-compatible with openpi's msgpack_numpy
   capabilities.py        PolicyCapabilities: state placement, condition kind, frequency mode
   policy.py              Policy: backbone + head prototype + capability declaration
   quantization/
@@ -76,16 +86,14 @@ vla_runtime/
   errors.py              Exception hierarchy with trace context
 
 benchmarks/
-  sim/                   Closed-loop LIBERO / ManiSkill benchmark, and the real model
-                         adapters: π0.5 and SmolVLA split at the prefix-KV boundary,
-                         CUDA Graph capture for the expert loop
+  sim/                   Closed-loop LIBERO / ManiSkill benchmark (wraps vla_runtime.models
+                         policies for the harness)
   latency/               Model-level latency / FPS benchmark
   closed_loop/           ARX X5 real-robot closed-loop latency benchmark
 examples/                End-to-end runnable examples
 tests/                   Unit tests, CPU only
 ```
 
-The model adapters and CUDA Graph capture currently live under `benchmarks/sim/`; moving them into the package is planned.
 
 ## Running the example
 

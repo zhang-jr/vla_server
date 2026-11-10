@@ -254,7 +254,7 @@ class ActionHeadRuntime(Protocol):
         - FlowMatchingHead (flow_matching): reference MLP head for tests and
           the mock sim policy
         - PrefixKVExpertHead (flow_matching): the π0.5 / SmolVLA action expert
-          over per-layer prefix K/V, in ``benchmarks/sim/lerobot_smolvla.py``
+          over per-layer prefix K/V, in ``vla_runtime/models/prefix_kv.py``
 
     The predict() method is synchronous. The AsyncScheduler manages timing.
     Each robot instance has its own ActionHeadRuntime — state isolation is

@@ -46,22 +46,21 @@ prediction past a hard limit. See ``vla_runtime/serving/admission.py``.
 
 Usage::
 
-    fleet = FleetScheduler(
-        vlm_backend=vllm_backend,
-        capabilities=caps,
-        config=FleetConfig(max_robots=8),
-    )
+    fleet = FleetScheduler.from_policy(policy, FleetConfig(max_robots=8))
     await fleet.start()
 
-    fleet.register_robot("robot_0", action_head=flow_head, priority=1)
-    fleet.register_robot("robot_1", action_head=diffusion_head, priority=1)
+    await fleet.register_robot("robot_0")      # head spawned from the policy
+    await fleet.register_robot("robot_1", priority=0)
 
     handle = await fleet.submit("robot_0", request)
     async for chunk in fleet.stream(handle):
         send_to_robot(chunk)
 
-    fleet.deregister_robot("robot_0")
+    await fleet.deregister_robot("robot_0")
     await fleet.stop()
+
+Over the network, ``vla_runtime.serving.api_server.PolicyServer`` registers one
+robot per WebSocket connection and runs each request through this fleet.
 """
 
 from __future__ import annotations
@@ -203,7 +202,7 @@ class FleetScheduler:
     """Multi-robot fleet scheduler with shared VLM and isolated action heads.
 
     Args:
-        vlm_backend: Shared VLM backend (vLLM, SGLang, llama.cpp, etc.).
+        vlm_backend: Shared VLM backend (e.g. a PrefixKVBackbone).
         capabilities: What the served policy supports (ADR-018).
         config: Fleet configuration.
     """

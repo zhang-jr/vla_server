@@ -211,7 +211,7 @@ class VLMBackend(Protocol):
     """Protocol that every VLM backend adapter must satisfy.
 
     Implementations:
-        - PrefixKVBackbone (``benchmarks/sim/lerobot_smolvla.py``): runs the
+        - PrefixKVBackbone (``vla_runtime/models/prefix_kv.py``): runs the
           π0.5 / SmolVLA VLM over the prefix in-process and returns its
           per-layer K/V as a ``per_layer_kv`` condition
 

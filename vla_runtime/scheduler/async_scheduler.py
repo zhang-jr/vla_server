@@ -29,7 +29,7 @@ The scheduler owns the event loop. Business modules must NOT call asyncio.run().
 Usage::
 
     scheduler = AsyncScheduler(
-        vlm_backend=vllm_backend,
+        vlm_backend=backbone,
         action_head=flow_matching_head,
         capabilities=PolicyCapabilities(
             state_placement="suffix",
@@ -113,7 +113,7 @@ class AsyncScheduler:
     """Three-stage async pipeline for VLA inference.
 
     Args:
-        vlm_backend: VLMBackend implementation (vLLM / SGLang / llama.cpp).
+        vlm_backend: VLMBackend implementation (e.g. a PrefixKVBackbone).
         action_head: ActionHeadRuntime implementation.
         capabilities: What the loaded policy supports (ADR-018). Required:
             whether state goes to the backbone and whether the head may re-run

@@ -20,9 +20,14 @@ classifiers = [
 
 dependencies = [
     "torch>=2.2.0",
+    "numpy>=1.24",
     "pydantic>=2.0",
     "msgpack>=1.0",
+    "websockets>=14",
 ]
+
+[project.scripts]
+vla-serve = "vla_runtime.serving.api_server:main"
 
 [project.optional-dependencies]
 # Closed-loop sim benchmarks (benchmarks/sim) — remote GPU host only.

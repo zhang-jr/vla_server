@@ -12,7 +12,7 @@ Convention used throughout this module (the paper's): ``tau`` runs from 0
 ``dt > 0``, and the one-step estimate of the clean chunk is
 ``x1_hat = x + (1 - tau) * v``. Heads that integrate the other way
 (SmolVLA / pi0: time 1 -> 0) pass ``tau = 1 - time`` and a sign-flipped
-velocity; see ``benchmarks/sim/lerobot_smolvla.py``.
+velocity; see ``vla_runtime/models/prefix_kv.py::euler_denoise``.
 
 Per denoising step::
 

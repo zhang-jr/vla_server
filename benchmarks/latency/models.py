@@ -375,7 +375,7 @@ LEROBOT_PRESETS: dict[str, tuple[str, str]] = {
 class LeRobotModel:
     """A LeRobot policy through its processor pipeline + ``predict_action_chunk``.
 
-    Same path as ``benchmarks/sim/lerobot_smolvla.py::SmolVLAModel.native_chunk``:
+    Same path as ``vla_runtime/models/smolvla.py::SmolVLAModel.native_chunk``:
     preprocessor (normalize, tokenize, to device) → chunk → postprocessor
     (unnormalize) → host. Cameras and state size come from the checkpoint's
     ``input_features``. π0 / π0.5 tokenizers come from the gated

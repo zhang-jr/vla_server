@@ -105,5 +105,6 @@ A failed `predict_batch` emits `fleet_head_batch_fallback` and retries every row
 
 - [Architecture](./architecture.md) — the pipeline each robot runs through
 - [Scheduler](./scheduler.md) — the single-robot equivalent and its degradation hooks
-- [VLM backends](./vlm-backends.md) — the shared backbone and its KV cache
+- [VLM backends](./vlm-backends.md) — the shared backbone and the condition it produces
+- [Policy server](./serving-api.md) — the WebSocket endpoint that registers one robot per connection
 - [Observability](./observability.md) — fleet events and metrics

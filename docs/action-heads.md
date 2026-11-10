@@ -91,13 +91,13 @@ Two integrators are available. Euler takes `n_steps` fixed steps. RK4 evaluates 
 
 ### Prefix-KV action expert
 
-Source: `benchmarks/sim/lerobot_smolvla.py` (`PrefixKVExpertHead`)
+Source: `vla_runtime/models/prefix_kv.py` (`PrefixKVExpertHead`); models in `vla_runtime/models/{smolvla,pi05}.py`
 
 The π0.5 and SmolVLA action experts, run over the `per_layer_kv` condition from the prefix-KV backbone ([VLM backends](./vlm-backends.md)). The expert keeps no state between calls, so spawned instances share the one loaded model and any instance can serve a batch. It implements all three optional capabilities:
 
 - batched denoising: per-layer K/V stacked along the batch, shorter prefixes right-padded and masked;
 - RTC guidance inside its Euler loop;
-- for π0.5, optional replay of the unguided loop from CUDA Graphs captured per batch size (`benchmarks/sim/cuda_graph.py`).
+- for π0.5, optional replay of the unguided loop from CUDA Graphs captured per batch size (`vla_runtime/action_head/cuda_graph.py`).
 
 The head is launch-bound. The π0.5 expert's 10 denoising steps take 84 ms eager and 33 ms replayed from a graph at batch 1, and a batch of four costs about the same as one row eager. That is why batching it across robots is nearly free.
 
