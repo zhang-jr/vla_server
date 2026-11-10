@@ -2,7 +2,7 @@
 
 The vision-language backbone is the half of a VLA policy that reads the camera views and the instruction. The runtime defines a narrow protocol for it; everything downstream depends only on the protocol, so backbones are interchangeable.
 
-Source: `vla_runtime/vlm/base.py` (protocol and data types); `benchmarks/sim/lerobot_smolvla.py` (the prefix-KV backbone).
+Source: `vla_runtime/vlm/base.py` (protocol and data types); `vla_runtime/models/prefix_kv.py` (the prefix-KV backbone).
 
 ## The protocol
 
@@ -85,7 +85,7 @@ Robot state travels as a tensor on its own channel and is handed to the action h
 
 ## The prefix-KV backbone
 
-Source: `benchmarks/sim/lerobot_smolvla.py` (`PrefixKVBackbone`), with model classes for SmolVLA (same file) and π0.5 (`benchmarks/sim/lerobot_pi05.py`)
+Source: `vla_runtime/models/prefix_kv.py` (`PrefixKVBackbone`), with model classes for SmolVLA (`vla_runtime/models/smolvla.py`) and π0.5 (`vla_runtime/models/pi05.py`); `vla_runtime/models/registry.py` loads them by name
 
 π0.5 and SmolVLA are each one network: a VLM runs over the prefix (camera views, instruction, and for these two models the robot state), and a flow-matching action expert attends over every layer's prefix K/V while it denoises. `PrefixKVBackbone.encode()` runs the LeRobot model's own prefix pass in-process and returns those K/V as a `per_layer_kv` condition. The matching head is `PrefixKVExpertHead` ([Action heads](./action-heads.md)). Together they reproduce the model's native `sample_actions` step for step; the GPU tests check the split against LeRobot's own inference with shared noise (max deviation 1e-3).
 
