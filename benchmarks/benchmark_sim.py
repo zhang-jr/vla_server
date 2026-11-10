@@ -51,14 +51,15 @@ pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 @pytest.fixture(scope="module")
 def smolvla_model():
     pytest.importorskip("lerobot")
-    from benchmarks.sim.lerobot_smolvla import SmolVLAModel
+    from vla_runtime.models.smolvla import SmolVLAModel
 
     repo, cameras, vlm = _smolvla_source()
     return SmolVLAModel(repo, torch.device("cuda"), cameras, vlm=vlm)
 
 
 def _smolvla_source() -> tuple[str, dict[str, str], str | None]:
-    from benchmarks.sim.lerobot_smolvla import DEFAULT_REPO, LIBERO_CAMERAS, parse_camera_map
+    from vla_runtime.models._lerobot import LIBERO_CAMERAS, parse_camera_map
+    from vla_runtime.models.smolvla import DEFAULT_REPO
 
     cameras = os.environ.get("VLA_SMOLVLA_CAMERAS")
     return (
@@ -71,8 +72,8 @@ def _smolvla_source() -> tuple[str, dict[str, str], str | None]:
 @pytest.fixture(scope="module")
 def pi05_model():
     pytest.importorskip("lerobot")
-    from benchmarks.sim.lerobot_pi05 import DEFAULT_REPO, PI05Model
-    from benchmarks.sim.lerobot_smolvla import LIBERO_CAMERAS
+    from vla_runtime.models._lerobot import LIBERO_CAMERAS
+    from vla_runtime.models.pi05 import DEFAULT_REPO, PI05Model
 
     model = PI05Model(
         os.environ.get("VLA_PI05_REPO", DEFAULT_REPO),
@@ -317,7 +318,7 @@ def test_pi05_velocity_matches_denoise_step(pi05_model):
 
 def test_pi05_cuda_graph_matches_eager(pi05_model):
     """V4: graph replay == eager, bit for bit, on fresh inputs and per batch size."""
-    from benchmarks.sim.cuda_graph import GraphCache
+    from vla_runtime.action_head.cuda_graph import GraphCache
 
     model = pi05_model
     rows, noise = _pi05_rows(model)
@@ -361,7 +362,7 @@ def test_pi05_expert_sdpa_close_to_eager(pi05_model):
 
 def test_pi05_cuda_graph_head_latency(pi05_model, record_property):
     """V4: expert loop P50, eager vs CUDA Graph, per batch size."""
-    from benchmarks.sim.cuda_graph import GraphCache
+    from vla_runtime.action_head.cuda_graph import GraphCache
 
     model = pi05_model
     rows, _ = _pi05_rows(model)

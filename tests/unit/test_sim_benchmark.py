@@ -17,15 +17,6 @@ import torch
 
 from benchmarks.sim.env_process import EnvProcessError, ProcessEnv
 from benchmarks.sim.envs import EnvSpec, MockBenchEnv, env_factory, quat2axisangle
-from benchmarks.sim.lerobot_smolvla import (
-    _batch_first,
-    _heads_first,
-    _kv_layout,
-    batch_guidance,
-    euler_denoise,
-    parse_camera_map,
-    stack_prefix_kv,
-)
 from benchmarks.sim.metrics import (
     boundary_discontinuity,
     jerk_rms,
@@ -37,6 +28,9 @@ from benchmarks.sim.metrics import (
 from benchmarks.sim.policies import make_policy
 from benchmarks.sim.run import build_configs, parse_args
 from benchmarks.sim.runners import RunConfig, episode_plan, run_benchmark
+from vla_runtime.models._lerobot import parse_camera_map
+from vla_runtime.models.prefix_kv import batch_guidance, euler_denoise, stack_prefix_kv
+from vla_runtime.models.smolvla import _batch_first, _heads_first, _kv_layout
 from vla_runtime.action_head.base import ActionHeadContext
 from vla_runtime.action_head.rtc import RTCConfig, prepare_guidance
 from vla_runtime.vlm.base import Embedding, LayerKV
