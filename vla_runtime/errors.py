@@ -104,24 +104,34 @@ class BudgetExceededError(PipelineError):
 
 
 class EmbeddingStaleError(PipelineError):
-    """Cached embedding reused beyond the tolerated frame count.
+    """A reused condition is older than the model tolerates.
 
-    Raised when VLM timeout fallback has been active for too many consecutive
-    frames and the cached embedding is no longer trustworthy.
+    The tolerance is ``PolicyCapabilities.max_condition_staleness_ms`` —
+    calibrated per model and task suite by sim success rate (ADR-018), not a
+    frame count, because how long a condition stays usable depends on the
+    model and the scene, not on how many requests arrived meanwhile.
     """
 
     def __init__(
         self,
-        stale_frames: int,
-        max_stale_frames: int,
+        age_ms: float,
+        max_age_ms: float,
         context: Optional[ErrorContext] = None,
     ) -> None:
-        self.stale_frames = stale_frames
-        self.max_stale_frames = max_stale_frames
+        self.age_ms = age_ms
+        self.max_age_ms = max_age_ms
         super().__init__(
-            f"Embedding stale for {stale_frames} frames (max={max_stale_frames})",
+            f"Condition stale: {age_ms:.1f}ms old (max={max_age_ms:.1f}ms)",
             context,
         )
+
+
+class PolicyCapabilityError(PipelineError):
+    """An operation the loaded policy's declared capabilities do not support.
+
+    Example: asking a coupled-frequency model to re-run its action head on a
+    cached condition, which yields no new information for that model (ADR-018).
+    """
 
 
 # ── Quantization ──────────────────────────────────────────────────────────────

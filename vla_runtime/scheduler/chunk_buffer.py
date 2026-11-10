@@ -22,8 +22,11 @@ ADR-014 replaces the wholesale swap with four pluggable blend policies:
     ``trim``            Drop the leading ``min(k, latency_trim_steps)`` steps of
                         the new chunk (``k`` = steps consumed since the last
                         integrate), then replace. Fixes latency, not continuity.
+                        **Default.**
     ``linear_overlap``  ``trim`` plus a linear cross-fade over the overlap region
-                        (old 100%->0%, new 0%->100%). **Default.**
+                        (old 100%->0%, new 0%->100%). Smoothest, but mixes the
+                        old chunk's stale actions in; on LIBERO-10 it lost
+                        15-19 pp against ``trim`` at 150-500 ms (BENCHMARKS.md).
     ``ensemble``        ACT-style temporal ensembling: each chunk is anchored to
                         the global step it starts at, and every executed action
                         is an ``exp(-decay * i)`` weighted average over all
@@ -32,6 +35,13 @@ ADR-014 replaces the wholesale swap with four pluggable blend policies:
 ``linear_overlap`` and ``ensemble`` are ported from EVA-Client's
 ``strategy/action_buffer.py`` (Apache-2.0, arXiv:2607.02646), which validated
 them on eight real robots; ``ensemble`` follows ACT (arXiv:2304.13705).
+
+For RTC-capable heads (ADR-015) the buffer is also the source of the guidance
+context: :meth:`ChunkBuffer.rtc_context` snapshots the queued actions and the
+expected inference delay when an observation is taken. RTC removes the
+discontinuity at its source; the blend policy still applies on push, and
+``trim`` is the natural partner since the guided chunk already continues the
+old one.
 
 ``latency_trim_steps`` is never hardcoded: :meth:`ChunkBuffer.update_latency_trim`
 derives it from the measured end-to-end latency times the control rate, so the
@@ -58,8 +68,7 @@ from typing import Literal, Optional
 
 import torch
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadType
-from vla_runtime.errors import EmbeddingStaleError, ErrorContext
+from vla_runtime.action_head.base import ActionChunk, ActionHeadContext, ActionHeadType
 from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 
@@ -484,15 +493,15 @@ class ChunkBuffer:
     still queued is decided by ``blend_policy`` (ADR-014).
 
     Args:
-        max_stale_frames: Consecutive frames the embedding may be reused before
-            :meth:`mark_stale` raises EmbeddingStaleError.
         robot_id: Identifier for the robot owning this buffer (tracing).
         blend_policy: How a new chunk merges with the queued tail.
         latency_trim_steps: Initial cap on the leading steps dropped from a new
             chunk. Superseded by :meth:`update_latency_trim` once real latency
             has been measured.
-        max_latency_trim_steps: Ceiling for the derived trim, so a single latency
-            spike cannot swallow an entire chunk.
+        max_latency_trim_steps: Ceiling for the derived trim. None caps it at
+            one step short of the incoming chunk, so a latency spike cannot
+            swallow a whole chunk while every shorter delay is still fully
+            compensated; a fixed ceiling below the delay replays stale steps.
         blend_min_steps: Overlap floor for the ``linear_overlap`` policy.
         ensemble_decay: ``m`` in ``exp(-m * i)`` for the ``ensemble`` policy.
         control_rate_hz: Control loop rate, used to convert a measured latency
@@ -504,11 +513,10 @@ class ChunkBuffer:
 
     def __init__(
         self,
-        max_stale_frames: int = 5,
         robot_id: str = "robot_0",
-        blend_policy: ChunkBlendPolicy = "linear_overlap",
+        blend_policy: ChunkBlendPolicy = "trim",
         latency_trim_steps: int = 0,
-        max_latency_trim_steps: int = 8,
+        max_latency_trim_steps: Optional[int] = None,
         blend_min_steps: int = 8,
         ensemble_decay: float = 0.01,
         control_rate_hz: float = 50.0,
@@ -518,11 +526,15 @@ class ChunkBuffer:
                 f"unknown blend_policy {blend_policy!r}; "
                 f"expected one of {sorted(_BLENDERS)}"
             )
-        self._max_stale_frames = max_stale_frames
         self._robot_id = robot_id
         self._blend_policy: ChunkBlendPolicy = blend_policy
         self._latency_trim_steps = max(0, int(latency_trim_steps))
-        self._max_latency_trim_steps = max(0, int(max_latency_trim_steps))
+        # Unclamped steps-in-flight estimate; RTC's delay must not inherit the
+        # trim ceiling, which exists to protect the blend, not the guidance.
+        self._estimated_delay_steps = self._latency_trim_steps
+        self._max_latency_trim_steps = (
+            None if max_latency_trim_steps is None else max(0, int(max_latency_trim_steps))
+        )
         self._control_rate_hz = max(1.0, float(control_rate_hz))
 
         if blend_policy == "linear_overlap":
@@ -560,7 +572,10 @@ class ChunkBuffer:
             chunk: The action chunk just produced for this robot.
         """
         actions = chunk.actions.detach().clone()
-        info = self._blender.integrate(actions, max_trim=self._latency_trim_steps)
+        max_trim = self._latency_trim_steps
+        if self._max_latency_trim_steps is None:
+            max_trim = min(max_trim, actions.shape[0] - 1)
+        info = self._blender.integrate(actions, max_trim=max_trim)
 
         with self._lock:
             self._head_type = chunk.head_type
@@ -618,7 +633,7 @@ class ChunkBuffer:
         ``ceil(latency_ms / 1000 * control_rate_hz)`` is how many control steps
         elapse while the chunk is in flight — exactly the number of leading steps
         that are already stale on arrival. Clamped to ``max_latency_trim_steps``
-        so one spike cannot swallow a whole chunk.
+        when one is set; otherwise :meth:`push` caps it by the chunk length.
 
         Args:
             latency_ms: Measured latency from observation to chunk availability.
@@ -626,11 +641,16 @@ class ChunkBuffer:
         Returns:
             The trim now in effect, in control steps.
         """
-        steps = int(math.ceil(max(0.0, latency_ms) / 1000.0 * self._control_rate_hz))
-        steps = min(steps, self._max_latency_trim_steps)
+        estimated = int(math.ceil(max(0.0, latency_ms) / 1000.0 * self._control_rate_hz))
+        steps = (
+            estimated
+            if self._max_latency_trim_steps is None
+            else min(estimated, self._max_latency_trim_steps)
+        )
         with self._lock:
             changed = steps != self._latency_trim_steps
             self._latency_trim_steps = steps
+            self._estimated_delay_steps = estimated
         if changed:
             _tracer.event(
                 "latency_trim_updated",
@@ -640,25 +660,36 @@ class ChunkBuffer:
             )
         return steps
 
+    def rtc_context(self, delay_steps: Optional[int] = None) -> ActionHeadContext:
+        """Snapshot for RTC guidance, taken when the observation is captured.
+
+        Row 0 of ``prev_actions`` is the action the control loop emits next,
+        which is also step 0 of the chunk predicted from this observation.
+
+        Args:
+            delay_steps: Expected steps until the new chunk lands. Defaults to
+                the estimate from the last :meth:`update_latency_trim`, without
+                the trim ceiling.
+
+        Returns:
+            Context with ``prev_actions`` None when nothing is queued.
+        """
+        queued = self._blender.peek()
+        if delay_steps is None:
+            with self._lock:
+                delay_steps = self._estimated_delay_steps
+        prev = None if queued is None or queued.shape[0] == 0 else queued.detach().clone()
+        return ActionHeadContext(prev_actions=prev, inference_delay_steps=max(0, int(delay_steps)))
+
     def mark_stale(self) -> None:
-        """Count one frame that reused a stale embedding.
+        """Count one frame that fell back to a reused condition.
 
-        Called by AsyncScheduler.on_vlm_timeout() on each fallback frame.
-
-        Raises:
-            EmbeddingStaleError: When stale_frames exceeds max_stale_frames.
+        Observability only: whether a reused condition is still usable is
+        decided by the scheduler from its age against the policy's calibrated
+        tolerance (ADR-018), not from how many frames reused it.
         """
         with self._lock:
             self._stale_frames += 1
-            stale = self._stale_frames
-
-        if stale > self._max_stale_frames:
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="scheduler.chunk_buffer",
-                extra={"robot_id": self._robot_id},
-            )
-            raise EmbeddingStaleError(stale, self._max_stale_frames, ctx)
 
     def reset_stale(self) -> None:
         """Clear the stale-frame counter after a fresh embedding arrives."""
@@ -799,6 +830,7 @@ class ChunkBuffer:
                 "has_chunk": remaining > 0,
                 "remaining": remaining,
                 "latency_trim_steps": self._latency_trim_steps,
+                "estimated_delay_steps": self._estimated_delay_steps,
                 "consumed_since_push": consumed,
                 "stale_frames": self._stale_frames,
                 "total_frames": self._total_frames,

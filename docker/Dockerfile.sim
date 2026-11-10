@@ -1,0 +1,94 @@
+# Closed-loop sim layer on top of the benchmark image (TODO V0).
+#
+# Adds only what LIBERO needs; everything else (CUDA, torch, the four venvs,
+# sshd entrypoint) comes from the base image unchanged:
+#   - hf-libero + robosuite / MuJoCo in the default lerobot venv, torch pinned
+#   - NVIDIA EGL vendor file, so MuJoCo renders on the GPU instead of mesa
+#   - graphics in NVIDIA_DRIVER_CAPABILITIES, so the toolkit mounts libEGL_nvidia
+#
+# Nothing is downloaded at build or run time, and HF_HUB_OFFLINE makes any
+# accidental hub access fail instead of fetching. Fetch these on the host first:
+#   checkpoints        → /mnt/zjr/model_zoo/<name>            (/models in the container)
+#   lerobot/libero-assets (HF dataset repo)
+#                      → /mnt/zjr/vla_data/libero-assets     (/data/libero-assets)
+# The hf-libero wheel ships bddl files and init states but not the scene assets;
+# without them it would try to download them on first env creation.
+#
+# Build (base = vla-runtime:bench-v2, image 8bb7943070c0):
+#   docker build -f docker/Dockerfile.sim -t vla-runtime:sim-v4 docker
+# Layers are append-only, so a rebuild reuses the cache of everything above
+# the newest one.
+#
+# Run alongside vla-bench (same mounts; graphics capability is required):
+#   docker run -d --name vla-sim --gpus '"device=0"' \
+#     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+#     --shm-size 16g \
+#     -v /mnt/zjr/vla_data:/data -v /mnt/zjr/vla_data/code:/workspace/vla_server \
+#     -v /mnt/zjr/model_zoo:/models \
+#     vla-runtime:sim-v1
+ARG BASE_IMAGE=vla-runtime:bench-v2
+FROM ${BASE_IMAGE}
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    MUJOCO_GL=egl \
+    PYOPENGL_PLATFORM=egl \
+    HF_HUB_OFFLINE=1
+
+# GLVND looks up EGL vendors here; the CUDA base image only ships mesa's.
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+    && printf '{\n  "file_format_version": "1.0.0",\n  "ICD": {"library_path": "libEGL_nvidia.so.0"}\n}\n' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# Same pin as lerobot's own `libero` extra; the override keeps the CUDA 12.8 torch.
+# robomimic pulls egl-probe, whose CMakeLists predates 3.5 and fails on the
+# image's CMake 4 unless the policy floor is raised.
+RUN CMAKE_POLICY_VERSION_MINIMUM=3.5 uv pip install --python /opt/venvs/lerobot/bin/python \
+        --override /opt/vla/torch-overrides.txt \
+        "hf-libero>=0.1.4,<0.2.0" \
+    && /opt/vla/check-torch.sh /opt/venvs/lerobot
+
+# LIBERO asks where to keep its datasets on first import; take the defaults
+# non-interactively so later runs never block on stdin.
+RUN printf 'N\n' | /opt/venvs/lerobot/bin/python -c \
+        "from libero.libero import benchmark; print('libero suites:', sorted(benchmark.get_benchmark_dict()))" \
+    && /opt/venvs/lerobot/bin/python -c \
+        "import robosuite, mujoco, transformers; print('robosuite', robosuite.__version__, 'mujoco', mujoco.__version__, 'transformers', transformers.__version__)"
+
+# lerobot-eval (the reference the V0 alignment compares against) imports
+# lerobot.datasets, which needs the `dataset` extra. Installed from the same
+# editable source tree so the lerobot code itself does not change.
+RUN uv pip install --python /opt/venvs/lerobot/bin/python \
+        --override /opt/vla/torch-overrides.txt \
+        -e "/opt/src/lerobot[dataset]" \
+    && /opt/vla/check-torch.sh /opt/venvs/lerobot \
+    && /opt/venvs/lerobot/bin/python -c "import datasets, lerobot.scripts.lerobot_eval; print('datasets', datasets.__version__)"
+
+# LIBERO in the OpenVLA-OFT venv too, so the official openvla-oft
+# run_libero_eval.py can serve as an environment-stack reference with a
+# published success rate. numpy and the OFT transformers fork stay pinned
+# (tensorflow 2.15 needs numpy 1.x).
+RUN printf 'numpy==1.26.4\ntransformers==4.40.1\n' > /opt/vla/oft-pins.txt \
+    && CMAKE_POLICY_VERSION_MINIMUM=3.5 uv pip install --python /opt/venvs/oft/bin/python \
+        --override /opt/vla/torch-overrides.txt \
+        --override /opt/vla/oft-pins.txt \
+        "hf-libero>=0.1.4,<0.2.0" \
+    && /opt/vla/check-torch.sh /opt/venvs/oft \
+    && printf 'N\n' | /opt/venvs/oft/bin/python -c \
+        "from libero.libero import benchmark; import numpy, transformers, robosuite; print('oft venv: numpy', numpy.__version__, 'transformers', transformers.__version__, 'robosuite', robosuite.__version__)" \
+    && ln -s /data/libero-assets /opt/venvs/oft/lib/python3.10/site-packages/libero/libero/assets
+
+# Scene assets live on the /data mount. LIBERO checks the package-local
+# `assets` dir first, so a symlink there keeps it off the download path.
+RUN ln -s /data/libero-assets /opt/venvs/lerobot/lib/python3.12/site-packages/libero/libero/assets
+
+# Training-era LeRobot for the V0 drift check: smolvla_libero's train_config
+# has fields from main between 0.5.1 and 0.6.0, so 0.5.1 (transformers 5.3,
+# the dict prefix cache) is the closest release. Separate venv; the default
+# lerobot venv is untouched. The resolver re-fetches the ~600 MB cuDNN wheel
+# from the default mirror, which can exceed the image's 600 s HTTP timeout.
+RUN UV_HTTP_TIMEOUT=3600 VENV_PYTHON=3.12 /opt/vla/make-venv.sh /opt/venvs/lerobot051 \
+        "lerobot[smolvla,libero,dataset]==0.5.1" \
+    && /opt/vla/check-torch.sh /opt/venvs/lerobot051 \
+    && ln -s /data/libero-assets /opt/venvs/lerobot051/lib/python3.12/site-packages/libero/libero/assets \
+    && printf 'N\n' | /opt/venvs/lerobot051/bin/python -c \
+        "import lerobot, transformers, numpy; from libero.libero import benchmark; import lerobot.scripts.lerobot_eval; print('lerobot051:', lerobot.__version__, 'transformers', transformers.__version__, 'numpy', numpy.__version__)"

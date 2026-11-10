@@ -14,6 +14,12 @@ One `AsyncScheduler` serves one robot. It owns the event loop; business modules 
 scheduler = AsyncScheduler(
     vlm_backend=backend,
     action_head=head,
+    capabilities=PolicyCapabilities(
+        state_placement="suffix",          # pi0-like: state enters the action expert
+        condition_kind="per_layer_kv",
+        head_structure="iterative",
+        max_condition_staleness_ms=300.0,  # calibrated from sim success rate
+    ),
     budget_config=BudgetConfig(vlm_budget_ms=200, action_head_budget_ms=50),
     blend_policy="linear_overlap",
     control_rate_hz=50.0,
@@ -25,6 +31,8 @@ async for chunk in scheduler.stream(handle):
     send_to_robot(chunk)
 ```
 
+`AsyncScheduler.from_policy(policy, robot_id=...)` builds the same scheduler from a validated `Policy` (`vla_runtime/policy.py`), spawning the robot's head from the policy's prototype so it shares weights with other robots' heads.
+
 `start()` warms up the backend before any request is accepted, so first-call compilation cost does not register as a timeout. `submit()` runs the request through perception and action generation and returns a `RequestHandle`. `stream()` yields the resulting chunks; it drains anything already queued before checking whether the request has completed, since a request submitted and awaited will frequently be finished by the time the caller reaches the loop.
 
 Beyond the per-request stream, every produced chunk is also integrated into the scheduler's `ChunkBuffer`, which is what a control loop reads from continuously via `next_action()`.
@@ -35,13 +43,38 @@ Beyond the per-request stream, every produced chunk is also integrated into the 
 |---|---|---|
 | `vlm_backend` | — | Any `VLMBackend` implementation |
 | `action_head` | — | Any `ActionHeadRuntime` implementation |
+| `capabilities` | — (required) | The policy's `PolicyCapabilities`; see below |
 | `budget_config` | `BudgetConfig()` | Per-stage latency budgets |
-| `max_stale_frames` | 5 | Consecutive frames that may reuse a stale embedding |
 | `embedding_queue_maxsize` | 2 | Bound on the perception-to-action-generation queue |
 | `robot_id` | `"robot_0"` | Identifier attached to traces and metrics |
 | `blend_policy` | `"linear_overlap"` | How a new chunk merges with the queued tail |
 | `control_rate_hz` | 50.0 | Control loop rate, used to convert latency into chunk steps |
 | `auto_latency_trim` | `True` | Feed measured latency back into the chunk trim |
+
+### Policy capabilities and frequency mode
+
+Source: `vla_runtime/capabilities.py`
+
+A VLA policy is trained end to end, so a few facts that decide how it may be scheduled belong to the model rather than to the runtime. They are declared once per policy in a `PolicyCapabilities` (ADR-018) and are a required constructor argument — the scheduler does not guess them.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `state_placement` | `prefix`, `suffix`, `head_encoder`, `none` | Where robot state is consumed. `prefix` means the backbone needs it, so the scheduler passes it to `encode()` |
+| `condition_kind` | see `Embedding.kind` | What the head reads; every encode result is checked against it |
+| `head_structure` | `iterative`, `single_pass`, `monolithic` | Solver-loop head, one-pass parallel decode, or a fused policy whose boundary cannot be split |
+| `max_condition_staleness_ms` | float or `None` | How old a reused condition may be, calibrated per model and task suite from sim success rate |
+| `supports_rtc` | bool | Real-time chunking support (ADR-015); requires an iterative head |
+
+From these the policy derives its frequency mode. It is **decoupled** only when the head consumes fresh input of its own (`suffix` or `head_encoder`) and is iterative; otherwise it is **coupled**. A decoupled policy whose staleness tolerance is not yet calibrated still runs coupled (`effective_frequency_mode`), because reusing a condition without knowing how long it stays valid is a guess.
+
+| | Decoupled | Coupled |
+|---|---|---|
+| Head re-run on a cached condition | Yes — `replan(robot_state)` | Refused with `PolicyCapabilityError` |
+| Backbone timeout | Reuse the last condition if younger than `max_condition_staleness_ms`, else `EmbeddingStaleError` | No new chunk; the handle is marked `degraded="vlm_timeout_hold_tail"` and the control loop keeps executing the queued tail |
+
+The coupled timeout behavior is deliberate. For a policy whose head reads nothing but the condition — SmolVLA and π0.5 put state in the backbone prefix — re-running the head on the previous condition produces a new sample of a plan made from an observation the robot has since moved away from. Continuing the tail that is already queued is the better of the two stale options, and an empty buffer shows up as an underrun gap rather than as a silent replay.
+
+`replan()` is what frequency decoupling buys: between two backbone refreshes, the head reacts to where the robot actually is, without touching the backbone.
 
 ### Degradation hooks
 
@@ -49,11 +82,11 @@ Three methods define what happens when a stage cannot meet its budget. Subclass 
 
 ```python
 async def on_vlm_timeout(self, request, last_embedding) -> Embedding
-async def on_action_head_failure(self, request, error) -> ActionChunk
+async def on_action_head_failure(self, request_id, error) -> ActionChunk
 async def on_budget_exceeded(self, latency_ms, budget_ms) -> None
 ```
 
-The default `on_vlm_timeout()` returns the last good embedding and marks the frame stale. If there is no previous embedding — a timeout on the very first frame — it raises `VLMTimeoutError`, because there is nothing to degrade to. The default `on_action_head_failure()` returns a zero-action chunk tagged `{"fallback": True}` in its metadata so downstream consumers and traces can tell a real prediction from a safe stop.
+`on_vlm_timeout()` is called for decoupled policies only. The default returns the last good condition if it is within `max_condition_staleness_ms`, and raises `EmbeddingStaleError` otherwise. If there is no previous condition — a timeout on the very first frame — it raises `VLMTimeoutError`, because there is nothing to degrade to; a coupled policy raises the same error in that case. `on_action_head_failure()` takes a request ID rather than a request, since a `replan()` has no `ActionRequest`. The default `on_action_head_failure()` returns a zero-action chunk tagged `{"fallback": True}` in its metadata so downstream consumers and traces can tell a real prediction from a safe stop.
 
 A useful override for `on_vlm_timeout()` is a smaller local model as a second-tier fallback; a useful override for `on_action_head_failure()` is holding the last commanded pose rather than commanding zeros, which is the safer behavior on hardware where zero is a valid but undesirable joint target.
 
@@ -76,17 +109,17 @@ Four policies address this, selected by `blend_policy`.
 | Policy | Behavior |
 |---|---|
 | `replace` | Wholesale swap, no trim and no blending. Useful as a comparison baseline. |
-| `trim` | Drop the leading `min(k, latency_trim_steps)` steps of the new chunk, where `k` is the number of actions consumed since the last integration, then replace. Fixes the latency error but not the discontinuity. |
-| `linear_overlap` | `trim` plus a linear cross-fade across the overlap region — the queued tail fades from full weight to zero while the new chunk fades in. **Default.** |
+| `trim` | Drop the leading `min(k, latency_trim_steps)` steps of the new chunk, where `k` is the number of actions consumed since the last integration, then replace. Fixes the latency error but not the discontinuity. **Default.** |
+| `linear_overlap` | `trim` plus a linear cross-fade across the overlap region — the queued tail fades from full weight to zero while the new chunk fades in. |
 | `ensemble` | Every chunk is anchored to the global step its first action targets, and each executed action is an `exp(-decay * i)` weighted average over all chunks still covering that step, weighting the oldest surviving prediction most. |
 
-`linear_overlap` is the default because it addresses both problems at once and degrades gracefully: when the buffer has fully drained, the last executed action stands in as the old trajectory and is held for `blend_min_steps`, so the robot eases out of where it actually is rather than snapping to a fresh prediction's first step. `ensemble` averages away per-chunk prediction variance and is worth trying when a policy is noisy between samples, at the cost of holding several chunks at once.
+`trim` is the default because task success, not smoothness, decided it: on LIBERO-10 with π0.5 replanning every 5 steps, `linear_overlap` lost 15–19 pp against `trim` at 150–500 ms of latency (paired, p ≤ 0.004; see `BENCHMARKS.md`). The cross-fade keeps executing the old chunk's actions, which are stale by then. `linear_overlap` is still the smoothest policy and degrades gracefully: when the buffer has fully drained, the last executed action stands in as the old trajectory and is held for `blend_min_steps`, so the robot eases out of where it actually is rather than snapping to a fresh prediction's first step. For a smooth handover without the stale actions, use an RTC-capable head with `trim`. `ensemble` averages away per-chunk prediction variance and is worth trying when a policy is noisy between samples, at the cost of holding several chunks at once.
 
 ### Latency compensation
 
-`latency_trim_steps` is not a constant to be guessed at configuration time. `update_latency_trim(latency_ms)` derives it as `ceil(latency_ms / 1000 * control_rate_hz)` — the number of control steps that elapsed while the chunk was in flight, which is exactly the number of leading steps that were already stale on arrival. It is clamped by `max_latency_trim_steps` so one latency spike cannot swallow an entire chunk.
+`latency_trim_steps` is not a constant to be guessed at configuration time. `update_latency_trim(latency_ms)` derives it as `ceil(latency_ms / 1000 * control_rate_hz)` — the number of control steps that elapsed while the chunk was in flight, which is exactly the number of leading steps that were already stale on arrival. By default the trim is capped one step short of the incoming chunk, so every delay shorter than a chunk is fully compensated and a spike cannot swallow the whole chunk. An explicit `max_latency_trim_steps` sets a fixed ceiling instead; a ceiling below the real delay replays stale steps.
 
-`AsyncScheduler` calls this after every completed inference when `auto_latency_trim` is on, so compensation tracks the pipeline's measured behavior. When a chunk arrives so late that the trim would consume all of it, the chunk is dropped and the queued tail keeps running; the trace records this as a drop rather than silently substituting stale actions.
+`AsyncScheduler` calls this after every completed inference when `auto_latency_trim` is on, so compensation tracks the pipeline's measured behavior. With an explicit ceiling at or above the chunk length, a chunk that arrives so late that the trim would consume all of it is dropped and the queued tail keeps running; the trace records this as a drop rather than silently substituting stale actions.
 
 ### Seeding
 

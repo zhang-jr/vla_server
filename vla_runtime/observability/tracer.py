@@ -8,7 +8,7 @@ Usage::
     tracer = get_tracer("scheduler")
 
     with tracer.span("vlm_encode", request_id=req_id) as span:
-        embedding = await backend.encode(image, text)
+        embedding = await backend.encode(images, text)
         span.set_attribute("embedding_dim", embedding.dim)
         # span automatically records duration on exit
 

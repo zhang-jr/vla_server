@@ -5,7 +5,8 @@ Kernel tests (kernels/) are intentionally excluded here — they require real GP
 
 Coverage:
 - VLMBackend Protocol compliance
-- Embedding type correctness
+- Embedding type correctness, condition kinds (ADR-019)
+- ActionRequest multi-view validation
 - Timeout → VLMTimeoutError
 - Uninitialized backend → BackendError
 - QuantizationConfig integration
@@ -22,7 +23,8 @@ import torch
 
 from vla_runtime.errors import BackendError, VLMTimeoutError
 from vla_runtime.quantization.config import QuantizationConfig
-from vla_runtime.vlm.base import ActionRequest, Embedding, VLMBackend
+from vla_runtime.vlm.base import ActionRequest, Embedding, LayerKV, VLMBackend
+from tests.unit.factories import make_robot_state
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -31,12 +33,16 @@ def make_image(h: int = 224, w: int = 224, c: int = 3) -> torch.Tensor:
     return torch.rand(c, h, w)
 
 
+def make_views() -> dict[str, torch.Tensor]:
+    return {"base": make_image()}
+
+
 def make_request(instruction: str = "pick up the cup") -> ActionRequest:
     return ActionRequest(
         request_id="test-001",
-        image=make_image(),
+        images=make_views(),
         instruction=instruction,
-        robot_state=torch.zeros(14),
+        robot_state=make_robot_state(),
     )
 
 
@@ -70,7 +76,7 @@ class MockVLMBackend:
     def kv_cache_enabled(self) -> bool:
         return False
 
-    async def encode(self, image: torch.Tensor, text: str) -> Embedding:
+    async def encode(self, images, text: str, state=None) -> Embedding:
         if self._fail_encode:
             raise BackendError("Intentional test failure")
         if self._simulate_timeout:
@@ -81,7 +87,7 @@ class MockVLMBackend:
             model_id=self.model_id,
         )
 
-    async def generate(self, image: torch.Tensor, text: str):
+    async def generate(self, images, text: str, state=None):
         yield  # empty async generator
 
     async def warmup(self) -> None:
@@ -139,28 +145,28 @@ class TestEncode:
     @pytest.mark.asyncio
     async def test_encode_returns_embedding(self):
         backend = MockVLMBackend(hidden_dim=64)
-        emb = await backend.encode(make_image(), "test")
+        emb = await backend.encode(make_views(), "test")
         assert isinstance(emb, Embedding)
         assert emb.dim == 64
 
     @pytest.mark.asyncio
     async def test_encode_dtype_float16(self):
         backend = MockVLMBackend()
-        emb = await backend.encode(make_image(), "test")
+        emb = await backend.encode(make_views(), "test")
         assert emb.data.dtype == torch.float16
 
     @pytest.mark.asyncio
     async def test_encode_failure_raises_backend_error(self):
         backend = MockVLMBackend(fail_encode=True)
         with pytest.raises(BackendError):
-            await backend.encode(make_image(), "test")
+            await backend.encode(make_views(), "test")
 
     @pytest.mark.asyncio
     async def test_encode_timeout(self):
         backend = MockVLMBackend(simulate_timeout=True)
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
-                backend.encode(make_image(), "test"),
+                backend.encode(make_views(), "test"),
                 timeout=0.05,
             )
 
@@ -224,3 +230,98 @@ class TestQuantizationConfig:
         summary = cfg.summary()
         assert "w4a16" in summary
         assert "w8a8" in summary
+
+
+# ── Condition kinds (ADR-019) ─────────────────────────────────────────────────
+
+def _kv(seq_len: int, heads: int = 1, head_dim: int = 8) -> LayerKV:
+    t = torch.zeros(heads, seq_len, head_dim, dtype=torch.float16)
+    return LayerKV(key=t, value=t.clone())
+
+
+class TestConditionKinds:
+    def test_kind_inferred_from_data_rank(self):
+        assert Embedding(data=torch.zeros(8)).kind == "pooled"
+        assert Embedding(data=torch.zeros(5, 8)).kind == "prefix_tokens"
+
+    def test_seq_len(self):
+        assert Embedding(data=torch.zeros(8)).seq_len is None
+        assert Embedding(data=torch.zeros(5, 8)).seq_len == 5
+        emb = Embedding(kind="per_layer_kv", layer_kv=[_kv(6), _kv(6)])
+        assert emb.seq_len == 6
+        assert emb.num_layers == 2
+
+    def test_per_layer_kv_needs_layers(self):
+        with pytest.raises(ValueError, match="layer_kv"):
+            Embedding(kind="per_layer_kv")
+
+    def test_per_layer_kv_layers_must_agree_on_length(self):
+        with pytest.raises(ValueError, match="prefix length"):
+            Embedding(kind="per_layer_kv", layer_kv=[_kv(6), _kv(7)])
+
+    def test_layer_kv_shape_checks(self):
+        with pytest.raises(ValueError, match="mismatch"):
+            LayerKV(key=torch.zeros(1, 4, 8), value=torch.zeros(1, 5, 8))
+        with pytest.raises(ValueError, match="num_kv_heads"):
+            LayerKV(key=torch.zeros(4, 8), value=torch.zeros(4, 8))
+
+    def test_projected_features_needs_features(self):
+        with pytest.raises(ValueError, match="features"):
+            Embedding(kind="projected_features")
+        emb = Embedding(kind="projected_features", features={"vl": torch.zeros(3, 8)})
+        assert emb.seq_len is None
+
+    def test_pooled_rejects_wrong_rank(self):
+        with pytest.raises(ValueError, match="pooled"):
+            Embedding(data=torch.zeros(2, 8), kind="pooled")
+
+    def test_dim_undefined_without_data(self):
+        emb = Embedding(kind="per_layer_kv", layer_kv=[_kv(4)])
+        with pytest.raises(ValueError, match="no `data`"):
+            _ = emb.dim
+
+    def test_attention_mask_validated(self):
+        mask = torch.tensor([True, True, False])
+        assert Embedding(data=torch.zeros(3, 8), attention_mask=mask).attention_mask is mask
+        with pytest.raises(ValueError, match="length"):
+            Embedding(data=torch.zeros(4, 8), attention_mask=mask)
+        with pytest.raises(ValueError, match="bool"):
+            Embedding(data=torch.zeros(3, 8), attention_mask=torch.ones(3))
+
+    def test_nbytes_counts_every_payload(self):
+        emb = Embedding(
+            kind="per_layer_kv",
+            layer_kv=[_kv(10, heads=2, head_dim=4)] * 3,
+            attention_mask=torch.ones(10, dtype=torch.bool),
+        )
+        # 3 layers x (K + V) x 2 heads x 10 tokens x 4 dims x 2 bytes + 10-byte mask
+        assert emb.nbytes == 3 * 2 * (2 * 10 * 4 * 2) + 10
+
+    def test_pi0_scale_prefix_kv_is_megabytes(self):
+        """Why the edge-cloud split cannot sit at the VLM -> head boundary for pi0-like models.
+
+        Shape assumption (~800 prefix tokens, 18 layers, 1 KV head, head_dim 256)
+        mirrors a Gemma-2B backbone; see ADR-018.
+        """
+        emb = Embedding(kind="per_layer_kv", layer_kv=[_kv(800, heads=1, head_dim=256)] * 18)
+        assert 14e6 < emb.nbytes < 16e6
+
+
+class TestActionRequest:
+    def test_requires_a_camera_view(self):
+        with pytest.raises(ValueError, match="camera"):
+            ActionRequest(
+                request_id="r",
+                images={},
+                instruction="x",
+                robot_state=make_robot_state(),
+            )
+
+    def test_keeps_view_order(self):
+        req = ActionRequest(
+            request_id="r",
+            images={"wrist": make_image(), "base": make_image()},
+            instruction="x",
+            robot_state=make_robot_state(),
+        )
+        assert list(req.images) == ["wrist", "base"]

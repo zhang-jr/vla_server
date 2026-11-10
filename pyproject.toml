@@ -37,6 +37,11 @@ edge = ["llama-cpp-python>=0.2.0"]
 triton-dev = ["triton>=2.3.0"]
 tensorrt = ["tensorrt>=10.0"]
 
+# Closed-loop sim benchmarks (benchmarks/sim) — remote GPU host only.
+# SmolVLA comes from LeRobot (processor API, 0.4+); LIBERO via LeRobot's extra.
+sim-libero = ["lerobot[smolvla,libero]>=0.4"]
+sim-maniskill = ["lerobot[smolvla]>=0.4", "mani-skill>=3.0.0b20"]
+
 # Testing
 test = [
     "pytest>=8.0",

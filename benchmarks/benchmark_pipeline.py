@@ -33,13 +33,29 @@ import torch
 
 
 def _make_request(robot_id: str = "robot_0") -> "ActionRequest":
+    from vla_runtime.action_head.base import RobotState
     from vla_runtime.vlm.base import ActionRequest
     import uuid
     return ActionRequest(
-        image=torch.zeros(3, 224, 224),
+        images={"base": torch.zeros(3, 224, 224)},
         instruction="pick up the apple",
-        robot_state=torch.zeros(14),
+        robot_state=RobotState(
+            joint_positions=torch.zeros(7),
+            joint_velocities=torch.zeros(7),
+            gripper_state=torch.zeros(1),
+        ),
         request_id=str(uuid.uuid4()),
+    )
+
+
+def _capabilities() -> "PolicyCapabilities":
+    """pi0-like policy; the mock backbone emits a [1, 4096] prefix-token condition."""
+    from vla_runtime.capabilities import PolicyCapabilities
+    return PolicyCapabilities(
+        state_placement="suffix",
+        condition_kind="prefix_tokens",
+        head_structure="iterative",
+        max_condition_staleness_ms=500.0,
     )
 
 
@@ -49,15 +65,11 @@ class _FastMockVLMBackend:
     latency_budget_ms: float = 200.0
     kv_cache_enabled: bool = False
 
-    async def encode(self, image, text):
+    async def encode(self, images, text, state=None):
         from vla_runtime.vlm.base import Embedding
-        return Embedding(
-            tensor=torch.zeros(1, 4096),
-            model_id="mock",
-            timestamp=time.time(),
-        )
+        return Embedding(data=torch.zeros(1, 4096), model_id="mock")
 
-    async def generate(self, image, text):
+    async def generate(self, images, text, state=None):
         raise NotImplementedError
 
     async def warmup(self) -> None:
@@ -74,9 +86,9 @@ class _LatencyMockVLMBackend(_FastMockVLMBackend):
         self._latency_s = latency_ms / 1000.0
         self.latency_budget_ms = latency_ms * 1.5
 
-    async def encode(self, image, text):
+    async def encode(self, images, text, state=None):
         await asyncio.sleep(self._latency_s)
-        return await super().encode(image, text)
+        return await super().encode(images, text, state)
 
 
 class _MockFlowMatchingHead:
@@ -108,6 +120,7 @@ async def _async_scheduler_round_trip(vlm_latency_ms: float) -> float:
     scheduler = AsyncScheduler(
         vlm_backend=backend,
         action_head=head,
+        capabilities=_capabilities(),
         budget_config=BudgetConfig(
             vlm_budget_ms=vlm_latency_ms * 2,
             action_head_budget_ms=50.0,
@@ -156,6 +169,7 @@ async def _fleet_multi_robot(num_robots: int, requests_per_robot: int) -> float:
     vlm = _FastMockVLMBackend()
     fleet = FleetScheduler(
         vlm_backend=vlm,
+        capabilities=_capabilities(),
         config=FleetConfig(max_robots=num_robots, vlm_budget_ms=50.0),
     )
     await fleet.start()
@@ -291,6 +305,7 @@ def test_throughput_single_robot():
         scheduler = AsyncScheduler(
             vlm_backend=backend,
             action_head=head,
+            capabilities=_capabilities(),
             budget_config=BudgetConfig(vlm_budget_ms=200.0, action_head_budget_ms=50.0),
         )
         await scheduler.start()

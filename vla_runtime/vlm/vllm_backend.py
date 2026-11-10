@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping, Optional
 
 import torch
 
+from vla_runtime.action_head.base import RobotState
 from vla_runtime.errors import BackendError, ErrorContext, VLMTimeoutError
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding, TokenChunk, TokenStream
@@ -104,8 +105,13 @@ class VLLMBackend:
 
     # ── Core interface ────────────────────────────────────────────────────────
 
-    async def encode(self, image: torch.Tensor, text: str) -> Embedding:
-        """Encode image + instruction → Embedding via vLLM's multimodal path."""
+    async def encode(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> Embedding:
+        """Encode camera views + instruction → Embedding via vLLM's multimodal path."""
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
             trace_id=_tracer.trace_id,
@@ -117,7 +123,7 @@ class VLLMBackend:
             self._assert_ready(ctx)
             try:
                 result = await asyncio.wait_for(
-                    self._run_encode(image, text, request_id),
+                    self._run_encode(images, text, request_id),
                     timeout=self._latency_budget_ms / 1000.0,
                 )
                 span.set_attribute("embedding_dim", result.dim)
@@ -132,7 +138,12 @@ class VLLMBackend:
                 span.set_error(exc)
                 raise BackendError(f"vLLM encode failed: {exc}", ctx) from exc
 
-    async def generate(self, image: torch.Tensor, text: str) -> TokenStream:
+    async def generate(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> TokenStream:
         """Stream action tokens via vLLM generation (discrete-token models)."""
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
@@ -141,7 +152,7 @@ class VLLMBackend:
             request_id=request_id,
         )
         self._assert_ready(ctx)
-        return self._stream_tokens(image, text, request_id, ctx)
+        return self._stream_tokens(images, text, request_id, ctx)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -153,7 +164,7 @@ class VLLMBackend:
             )
 
     async def _run_encode(
-        self, image: torch.Tensor, text: str, request_id: str
+        self, images: Mapping[str, torch.Tensor], text: str, request_id: str
     ) -> Embedding:
         """Internal: run the actual vLLM multimodal encode.
 
@@ -175,7 +186,7 @@ class VLLMBackend:
 
     async def _stream_tokens(
         self,
-        image: torch.Tensor,
+        images: Mapping[str, torch.Tensor],
         text: str,
         request_id: str,
         ctx: ErrorContext,

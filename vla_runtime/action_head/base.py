@@ -2,7 +2,10 @@
 
 ActionHeadRuntime is intentionally synchronous — frequency guarantees are
 provided by the caller (AsyncScheduler), not by the action head itself.
-Each robot instance gets its own ActionHeadRuntime; they are NOT shared.
+Each robot gets its own ActionHeadRuntime instance, because instances carry
+per-robot state. Instances for different robots can still share one copy of
+the read-only weights: ``spawn()`` returns a new instance bound to the same
+SharedWeights (ADR-012 ③).
 
 Data flow:
     Embedding + RobotState → ActionHeadRuntime.predict() → ActionChunk
@@ -19,10 +22,13 @@ Quantization constraint (ADR-003):
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
+from torch import nn
 
 ActionHeadType = Literal["discrete_token", "flow_matching", "diffusion"]
 
@@ -109,6 +115,79 @@ class ActionChunk:
         return self.actions[idx]
 
 
+@dataclass
+class ActionHeadContext:
+    """What the caller knows about the chunk being replaced (ADR-015, RTC).
+
+    Captured when the observation is taken, so row 0 of ``prev_actions`` and
+    step 0 of the chunk about to be predicted refer to the same control step.
+
+    Attributes:
+        prev_actions: [n, action_dim] actions still queued for execution, in
+            the executed-action space (what the control loop sends). None at
+            episode start or when the buffer has drained.
+        inference_delay_steps: Control steps expected to elapse before the new
+            chunk is available; that many leading steps execute from
+            ``prev_actions`` regardless and are frozen during denoising.
+        extra: Head-specific extras.
+    """
+
+    prev_actions: torch.Tensor | None = None
+    inference_delay_steps: int = 0
+    extra: dict = field(default_factory=dict)
+
+
+# ── Shared weights ────────────────────────────────────────────────────────────
+
+class SharedWeights:
+    """Read-only head weights and their device, shared across robot instances.
+
+    Every head instance spawned from the same original holds a reference to one
+    SharedWeights, so N robots cost one copy of the weights. Operations on it —
+    moving to a device, loading a checkpoint — are group-wide by construction:
+    there is only one tensor to move. Callers must not run them while any
+    sharing instance is serving a predict().
+
+    The module is put in eval mode with gradients disabled: inference must not
+    mutate shared state, and a stray backward pass would.
+
+    Args:
+        module: The head's network, or None for heads without learned weights.
+        device: Device the module lives on.
+    """
+
+    def __init__(self, module: Optional[nn.Module], device: torch.device) -> None:
+        self._module = module
+        self._device = device
+        self._lock = threading.Lock()
+        if module is not None:
+            module.eval()
+            module.requires_grad_(False)
+
+    @property
+    def module(self) -> Optional[nn.Module]:
+        return self._module
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def to(self, device: torch.device) -> None:
+        """Move the shared weights; affects every instance sharing them."""
+        with self._lock:
+            if self._module is not None:
+                self._module = self._module.to(device)
+            self._device = device
+
+    def load(self, checkpoint_path: str) -> None:
+        """Load a checkpoint into the shared weights; affects every sharer."""
+        with self._lock:
+            if self._module is None:
+                return
+            state_dict = torch.load(checkpoint_path, map_location=self._device)
+            self._module.load_state_dict(state_dict)
+
+
 # ── Shared conditioning checks ────────────────────────────────────────────────
 
 def check_conditioning_dims(
@@ -117,6 +196,7 @@ def check_conditioning_dims(
     state_dim: int,
     embedding: "vla_runtime.vlm.base.Embedding",  # noqa: F821
     robot_state: RobotState,
+    accepted_kinds: tuple[str, ...] = ("pooled",),
 ) -> None:
     """Validate that the conditioning inputs match how the head was configured.
 
@@ -131,12 +211,22 @@ def check_conditioning_dims(
         state_dim: Flat state width the head was built for.
         embedding: The embedding about to be consumed.
         robot_state: The robot state about to be consumed.
+        accepted_kinds: Condition kinds this head can read (Embedding.kind).
+            The built-in MLP heads read a pooled vector only; a model whose
+            expert attends over prefix tokens or per-layer K/V needs a head
+            that implements that attention.
 
     Raises:
-        ValueError: If either width disagrees with the head's configuration.
-            Callers wrap this in ActionHeadFailureError alongside their own
-            failure handling.
+        ValueError: If the condition kind is not accepted, or either width
+            disagrees with the head's configuration. Callers wrap this in
+            ActionHeadFailureError alongside their own failure handling.
     """
+    if embedding.kind not in accepted_kinds:
+        raise ValueError(
+            f"{head_type} head reads {list(accepted_kinds)} conditions but got "
+            f"{embedding.kind!r}; check PolicyCapabilities.condition_kind against "
+            f"the head implementation"
+        )
     actual_embedding_dim = embedding.data.shape[-1]
     if actual_embedding_dim != embedding_dim:
         raise ValueError(
@@ -226,3 +316,103 @@ class ActionHeadRuntime(Protocol):
     def to_device(self, device: torch.device) -> None:
         """Move weights to the specified device."""
         ...
+
+
+@runtime_checkable
+class WeightSharingHead(Protocol):
+    """An action head whose instances can share one copy of the weights.
+
+    Implemented by the built-in heads and TensorRTBackend. Kept separate from
+    ActionHeadRuntime so third-party heads without the capability still
+    satisfy the core Protocol.
+    """
+
+    def spawn(self) -> "WeightSharingHead":
+        """New instance for another robot: same weights, fresh per-robot state.
+
+        load_weights() / to_device() on any instance apply to all instances
+        sharing the weights.
+        """
+        ...
+
+    def shares_weights_with(self, other: object) -> bool:
+        """Whether ``other`` reads the same weight tensors as this instance."""
+        ...
+
+
+@runtime_checkable
+class RealTimeChunkingHead(Protocol):
+    """An iterative head that can condition denoising on the previous chunk (ADR-015).
+
+    Kept separate from ActionHeadRuntime, like WeightSharingHead, so heads
+    without RTC still satisfy the core Protocol. Schedulers pass a context
+    only when the policy declares ``supports_rtc`` and the head implements
+    this Protocol; ``predict(embedding, robot_state)`` keeps working
+    unchanged and samples unguided.
+    """
+
+    supports_rtc: bool
+
+    def predict(
+        self,
+        embedding: "vla_runtime.vlm.base.Embedding",  # noqa: F821
+        robot_state: RobotState,
+        context: Optional[ActionHeadContext] = None,
+    ) -> ActionChunk:
+        """Predict a chunk; with a context, guided to continue ``prev_actions``.
+
+        Raises:
+            ActionHeadFailureError: On any unrecoverable prediction error,
+                including a context whose shape does not match the head.
+        """
+        ...
+
+
+def head_supports_rtc(head: object) -> bool:
+    """Whether ``head`` can consume an ActionHeadContext."""
+    return isinstance(head, RealTimeChunkingHead) and bool(getattr(head, "supports_rtc", False))
+
+
+@runtime_checkable
+class BatchedActionHead(Protocol):
+    """A head that predicts for several robots in one call (ADR-022).
+
+    Optional, like WeightSharingHead: the fleet batches rows only across
+    instances that share weights and all implement this Protocol, and calls
+    ``predict_batch`` on one of them. That instance therefore serves rows
+    belonging to other robots' instances, so the call must keep no per-robot
+    state: every row has its own noise, condition, state, RTC context and
+    output, and nothing survives the call.
+    """
+
+    def shares_weights_with(self, other: object) -> bool:
+        """Whether ``other`` reads the same weight tensors as this instance."""
+        ...
+
+    def predict_batch(
+        self,
+        embeddings: Sequence["vla_runtime.vlm.base.Embedding"],  # noqa: F821
+        robot_states: Sequence[RobotState],
+        contexts: Sequence[Optional[ActionHeadContext]],
+    ) -> list[ActionChunk]:
+        """One chunk per row, each as ``predict()`` would return it for that row.
+
+        Args:
+            embeddings: One condition per row.
+            robot_states: One state per row.
+            contexts: One RTC context per row; None samples that row unguided.
+
+        Raises:
+            ActionHeadFailureError: If the batch fails; the caller falls back
+                to per-row ``predict()`` so one bad row fails only itself.
+        """
+        ...
+
+
+def heads_batch_together(head: object, other: object) -> bool:
+    """Whether the fleet may run ``head`` and ``other`` in one ``predict_batch``."""
+    return (
+        isinstance(head, BatchedActionHead)
+        and isinstance(other, BatchedActionHead)
+        and head.shares_weights_with(other)
+    )

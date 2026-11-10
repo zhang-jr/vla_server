@@ -20,6 +20,7 @@ This backend is the fallback when Triton kernel performance is insufficient
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -104,6 +105,41 @@ class TensorRTBackend:
     @property
     def action_dim(self) -> int:
         return self._wrapped.action_dim
+
+    @property
+    def accepted_condition_kinds(self) -> tuple[str, ...] | None:
+        return getattr(self._wrapped, "accepted_condition_kinds", None)
+
+    # ── Weight sharing (ADR-012 ③) ────────────────────────────────────────────
+
+    def spawn(self) -> "TensorRTBackend":
+        """New instance for another robot.
+
+        The compiled engine (the weights) is shared; the execution context is
+        not — TensorRT contexts hold per-inference activation state and must
+        not be used by two robots concurrently.
+
+        Raises:
+            TypeError: If the wrapped head cannot share its weights.
+        """
+        spawn_inner = getattr(self._wrapped, "spawn", None)
+        if spawn_inner is None:
+            raise TypeError(
+                f"{type(self._wrapped).__name__} does not support weight sharing (no spawn())"
+            )
+        clone = copy.copy(self)
+        clone._wrapped = spawn_inner()
+        clone._context = (
+            self._engine.create_execution_context() if self._engine is not None else None
+        )
+        return clone
+
+    def shares_weights_with(self, other: object) -> bool:
+        if not isinstance(other, TensorRTBackend):
+            return False
+        if self._engine is not None or other._engine is not None:
+            return self._engine is other._engine
+        return self._wrapped.shares_weights_with(other._wrapped)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

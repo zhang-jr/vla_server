@@ -6,7 +6,7 @@ CPU only, no GPU required. Coverage:
 - fully-stale chunk drop (trim >= chunk length)
 - seeding from the robot's measured pose, and easing out of a drained buffer
 - buffer-underrun gaps recorded as intervals
-- stale-embedding accounting and EmbeddingStaleError
+- stale-frame accounting (observability only; staleness is judged by the scheduler)
 - concurrent push / next_action, and the locked-blend fallback under starvation
 """
 
@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from vla_runtime.action_head.base import ActionChunk
-from vla_runtime.errors import EmbeddingStaleError
 from vla_runtime.scheduler.chunk_buffer import (
     _MAX_OPTIMISTIC_RETRIES,
     ChunkBuffer,
@@ -77,8 +76,8 @@ class TestConstruction:
         assert buf.is_exhausted()
         assert buf.current() is None
 
-    def test_default_policy_is_linear_overlap(self):
-        assert ChunkBuffer().blend_policy == "linear_overlap"
+    def test_default_policy_is_trim(self):
+        assert ChunkBuffer().blend_policy == "trim"
 
 
 # ── replace: legacy double-buffer semantics ───────────────────────────────────
@@ -155,7 +154,7 @@ class TestTrimPolicy:
         assert buf.consumed_since_push == 0
 
 
-# ── linear_overlap: the default ───────────────────────────────────────────────
+# ── linear_overlap ──────────────────────────────────────────────────────────────
 
 class TestLinearOverlapPolicy:
     def test_first_chunk_passes_through_unblended(self):
@@ -297,6 +296,25 @@ class TestLatencyTrim:
         buf = ChunkBuffer(control_rate_hz=50.0, max_latency_trim_steps=4)
         assert buf.update_latency_trim(1000.0) == 4
 
+    def test_default_ceiling_compensates_delays_past_eight_steps(self):
+        buf = ChunkBuffer(control_rate_hz=20.0)
+        # 500 ms at 20 Hz = 10 steps; the old fixed ceiling of 8 replayed two stale ones.
+        assert buf.update_latency_trim(500.0) == 10
+        buf.push(make_ramp_chunk(size=16))
+        for _ in range(12):
+            buf.next_action()
+        buf.push(make_ramp_chunk(size=16))
+        assert buf.next_action()[0].item() == 10.0
+
+    def test_default_ceiling_keeps_the_last_step_of_a_late_chunk(self):
+        buf = ChunkBuffer(control_rate_hz=20.0)
+        buf.update_latency_trim(5000.0)
+        buf.push(make_ramp_chunk(size=16))
+        for _ in range(16):
+            buf.next_action()
+        buf.push(make_ramp_chunk(size=16))
+        assert buf.next_action()[0].item() == 15.0
+
     def test_zero_latency_means_no_trim(self):
         buf = ChunkBuffer(control_rate_hz=50.0)
         assert buf.update_latency_trim(0.0) == 0
@@ -345,25 +363,25 @@ class TestBufferGap:
 
 class TestStaleFrames:
     def test_mark_stale_increments(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         assert buf.stale_frames == 1
 
-    def test_raises_once_the_tolerance_is_exceeded(self):
-        buf = ChunkBuffer(max_stale_frames=2)
-        buf.mark_stale()
-        buf.mark_stale()
-        with pytest.raises(EmbeddingStaleError):
+    def test_counting_never_raises(self):
+        """How long a condition stays usable is the scheduler's call (ADR-018)."""
+        buf = ChunkBuffer()
+        for _ in range(100):
             buf.mark_stale()
+        assert buf.stale_frames == 100
 
     def test_push_resets_the_counter(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         buf.push(make_chunk())
         assert buf.stale_frames == 0
 
     def test_reset_stale_clears_the_counter(self):
-        buf = ChunkBuffer(max_stale_frames=10)
+        buf = ChunkBuffer()
         buf.mark_stale()
         buf.reset_stale()
         assert buf.stale_frames == 0

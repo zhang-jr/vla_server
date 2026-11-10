@@ -20,10 +20,11 @@ import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import torch
 
+from vla_runtime.action_head.base import RobotState
 from vla_runtime.errors import BackendError, EdgeResourceError, ErrorContext, VLMTimeoutError
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding, TokenChunk, TokenStream
@@ -119,7 +120,12 @@ class LlamaCppBackend:
         self._executor.shutdown(wait=False)
         _tracer.event("llamacpp_shutdown", model=self._model_id)
 
-    async def encode(self, image: torch.Tensor, text: str) -> Embedding:
+    async def encode(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> Embedding:
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
             trace_id=_tracer.trace_id,
@@ -130,7 +136,7 @@ class LlamaCppBackend:
             self._assert_ready(ctx)
             try:
                 result = await asyncio.wait_for(
-                    self._run_encode_in_thread(image, text),
+                    self._run_encode_in_thread(images, text),
                     timeout=self._latency_budget_ms / 1000.0,
                 )
                 span.set_attribute("embedding_dim", result.dim)
@@ -143,7 +149,12 @@ class LlamaCppBackend:
                 span.set_error(exc)
                 raise BackendError(f"llama.cpp encode failed: {exc}", ctx) from exc
 
-    async def generate(self, image: torch.Tensor, text: str) -> TokenStream:
+    async def generate(
+        self,
+        images: Mapping[str, torch.Tensor],
+        text: str,
+        state: Optional[RobotState] = None,
+    ) -> TokenStream:
         """Token generation — only used when action head expects discrete tokens."""
         request_id = str(uuid.uuid4())[:8]
         ctx = ErrorContext(
@@ -152,7 +163,7 @@ class LlamaCppBackend:
             request_id=request_id,
         )
         self._assert_ready(ctx)
-        return self._stream_tokens_from_thread(image, text, ctx)
+        return self._stream_tokens_from_thread(images, text, ctx)
 
     def _assert_ready(self, ctx: ErrorContext) -> None:
         if self._llm is None:
@@ -161,7 +172,7 @@ class LlamaCppBackend:
             )
 
     async def _run_encode_in_thread(
-        self, image: torch.Tensor, text: str
+        self, images: Mapping[str, torch.Tensor], text: str
     ) -> Embedding:
         loop = asyncio.get_event_loop()
 
@@ -178,6 +189,6 @@ class LlamaCppBackend:
         return Embedding(data=tensor, model_id=self._model_id)
 
     async def _stream_tokens_from_thread(
-        self, image: torch.Tensor, text: str, ctx: ErrorContext
+        self, images: Mapping[str, torch.Tensor], text: str, ctx: ErrorContext
     ) -> AsyncIterator[TokenChunk]:
         yield TokenChunk(token_ids=[], is_final=True)

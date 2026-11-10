@@ -19,6 +19,7 @@ Architecture:
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Literal
 
@@ -30,6 +31,7 @@ from vla_runtime.action_head.base import (
     ActionChunk,
     ActionHeadType,
     RobotState,
+    SharedWeights,
     check_conditioning_dims,
 )
 from vla_runtime.errors import ActionHeadFailureError, ErrorContext
@@ -115,6 +117,9 @@ class DiffusionHead:
         device: Compute device.
     """
 
+    # The conditioning MLP reads one pooled vector (ADR-019).
+    accepted_condition_kinds: tuple[str, ...] = ("pooled",)
+
     def __init__(
         self,
         action_dim: int = 7,
@@ -133,15 +138,35 @@ class DiffusionHead:
         self._n_steps = n_steps
         self._sampler = sampler
         self._frequency_hz = frequency_hz
-        self._device = device or torch.device("cpu")
+        device = device or torch.device("cpu")
 
-        self._noise_predictor = NoisePredictorMLP(
-            embedding_dim=embedding_dim,
-            state_dim=state_dim,
-            action_dim=action_dim,
-        ).to(dtype=torch.float16, device=self._device)
+        self._weights = SharedWeights(
+            NoisePredictorMLP(
+                embedding_dim=embedding_dim,
+                state_dim=state_dim,
+                action_dim=action_dim,
+            ).to(dtype=torch.float16, device=device),
+            device,
+        )
 
         self._alpha_bars, self._sigmas = _build_schedule(n_steps)
+
+    @property
+    def _device(self) -> torch.device:
+        return self._weights.device
+
+    @property
+    def _noise_predictor(self) -> NoisePredictorMLP:
+        return self._weights.module
+
+    # ── Weight sharing (ADR-012 ③) ────────────────────────────────────────────
+
+    def spawn(self) -> "DiffusionHead":
+        """New instance for another robot, sharing these weights."""
+        return copy.copy(self)
+
+    def shares_weights_with(self, other: object) -> bool:
+        return getattr(other, "_weights", None) is self._weights
 
     # ── Protocol properties ───────────────────────────────────────────────────
 
@@ -209,6 +234,7 @@ class DiffusionHead:
             self._state_dim,
             embedding,
             robot_state,
+            self.accepted_condition_kinds,
         )
         B = self._chunk_size
         x = torch.randn(B, self._action_dim, dtype=torch.float16, device=self._device)
@@ -236,10 +262,10 @@ class DiffusionHead:
         return x  # [chunk_size, action_dim]
 
     def load_weights(self, checkpoint_path: str) -> None:
-        state_dict = torch.load(checkpoint_path, map_location=self._device)
-        self._noise_predictor.load_state_dict(state_dict)
+        """Load into the shared weights — applies to every spawned instance."""
+        self._weights.load(checkpoint_path)
         _tracer.event("diffusion_weights_loaded", path=checkpoint_path)
 
     def to_device(self, device: torch.device) -> None:
-        self._device = device
-        self._noise_predictor = self._noise_predictor.to(device)
+        """Move the shared weights — applies to every spawned instance."""
+        self._weights.to(device)

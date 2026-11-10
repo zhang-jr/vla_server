@@ -23,7 +23,7 @@ If you know vLLM or SGLang, this table locates the analogous components.
 ## Layers
 
 ```
-Application     ActionRequest: image + instruction + robot state
+Application     ActionRequest: camera views + instruction + robot state
 Serving         FleetScheduler — many robots over one shared backbone
 Pipeline        AsyncScheduler — perception -> action generation -> control
 Module          VLMBackend  |  ActionHeadRuntime
@@ -42,13 +42,14 @@ Infrastructure  Triton kernels  |  Quantization  |  Observability
 | [Quantization](./quantization.md) | Per-module precision policy, calibration, and task-success-rate validation |
 | [Kernels](./kernels.md) | The Triton kernels, their CPU fallbacks, and autotuning |
 | [Observability](./observability.md) | Structured tracing, metrics, and the error hierarchy |
+| [Benchmark methodology](./benchmark_methodology.md) | Closed-loop LIBERO / ManiSkill benchmarks: execution modes, metrics, and how to run them remotely |
 
 ## Repository map
 
 ```
 vla_runtime/
   vlm/                 VLMBackend protocol, four adapters, KV cache manager
-    base.py            Protocol, Embedding, ActionRequest, TokenStream
+    base.py            Protocol, Embedding (typed condition), LayerKV, ActionRequest, TokenStream
     vllm_backend.py    vLLM AsyncLLMEngine adapter
     sglang_backend.py  SGLang Runtime adapter
     llamacpp_backend.py  llama.cpp / GGUF adapter for edge devices
@@ -66,6 +67,7 @@ vla_runtime/
     budget_manager.py  Rolling P50/P95 latency budgets
   serving/
     fleet.py           Multi-robot scheduling over a shared backbone
+  capabilities.py      PolicyCapabilities: state placement, condition kind, frequency mode
   quantization/
     config.py          Per-module precision schemes and their constraints
     calibration.py     Reproducible per-module calibration pipeline

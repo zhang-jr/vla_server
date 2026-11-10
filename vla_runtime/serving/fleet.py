@@ -2,13 +2,24 @@
 
 Architecture (CLAUDE.md ADR-012):
     - One VLM backend instance shared across all robots.
-      Rationale: VLM computation is the bottleneck; sharing amortises cost.
+      Rationale: VLM weights dominate memory; one loaded instance serves the
+      fleet. Forward passes are not shared — each request is encoded on its
+      own, serially, in priority order (the backbone is compute-bound, so
+      batching it trades every robot's latency for ~10% throughput, ADR-022).
     - Per-robot ActionHeadRuntime instances — internal state (denoising
       trajectory, chunk offset) MUST NOT bleed between robots.
-    - Action head weights are shared across robot instances (memory efficiency),
-      but per-instance runtime state is fully isolated.
+    - Read-only action head weights are shared across those instances
+      (ADR-012 ③): a fleet built with from_policy() spawns each robot's head
+      from the policy's prototype. One instance registered for two robots is
+      refused — it would share state, not just weights.
     - Priority scheduling: safety-critical requests (priority=0) preempt
       lower-priority requests in the VLM queue.
+    - One PolicyCapabilities for the fleet: the shared VLM is one model, so
+      what crosses its boundary and whether heads may re-run on a cached
+      condition is decided once (ADR-018). On a VLM timeout a decoupled
+      policy reuses the robot's last condition within its staleness
+      tolerance; a coupled policy produces no chunk and the robot keeps
+      executing its queued tail.
 
 Priority levels:
     0 — safety-critical (e.g. emergency stop or human proximity avoidance)
@@ -17,14 +28,27 @@ Priority levels:
 
 Queue design:
     - VLM requests are queued by priority (heapq on (priority, seqno, item)).
-    - Action head prediction is per-robot, not queued globally.
-    - A single background coroutine drains the VLM queue and dispatches
-      embeddings to per-robot action head coroutines.
+    - A single background coroutine drains the VLM queue. Encoded requests
+      wait in a ready list for the head stage.
+    - Head batching (ADR-022): heads that share weights and implement
+      BatchedActionHead run every ready row in one predict_batch call — the
+      head is launch-bound, so a batch of four costs about one row. Nothing
+      waits for a batch to fill: while more requests whose heads batch with
+      the ready ones are queued, they are encoded first, otherwise the ready
+      rows run at once, a batch of one under light load. Other heads run
+      their own predict() as soon as their condition is ready.
+
+Admission control (ADR-023, ``FleetConfig.admission``): from the measured
+stage costs the fleet predicts its round latency for the registered robots,
+tells every robot the replan threshold that load calls for (chunk metadata
+``replan_threshold``), and can refuse a robot whose arrival would push the
+prediction past a hard limit. See ``vla_runtime/serving/admission.py``.
 
 Usage::
 
     fleet = FleetScheduler(
         vlm_backend=vllm_backend,
+        capabilities=caps,
         config=FleetConfig(max_robots=8),
     )
     await fleet.start()
@@ -47,20 +71,34 @@ import heapq
 import itertools
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Optional
 
-from vla_runtime.action_head.base import ActionChunk, ActionHeadRuntime, RobotState
+from vla_runtime.action_head.base import (
+    ActionChunk,
+    ActionHeadContext,
+    ActionHeadRuntime,
+    head_supports_rtc,
+    heads_batch_together,
+)
+from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.errors import (
     ActionHeadFailureError,
+    BudgetExceededError,
     EdgeResourceError,
+    EmbeddingStaleError,
     ErrorContext,
+    PolicyCapabilityError,
     VLMTimeoutError,
 )
 from vla_runtime.observability.metrics import get_metrics
 from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.scheduler.async_scheduler import RequestHandle
 from vla_runtime.scheduler.budget_manager import BudgetConfig, BudgetManager
+from vla_runtime.serving.admission import AdmissionConfig, AdmissionController
 from vla_runtime.vlm.base import ActionRequest, Embedding, VLMBackend
+
+if TYPE_CHECKING:
+    from vla_runtime.policy import Policy
 
 _tracer = get_tracer("serving.fleet")
 _metrics = get_metrics()
@@ -79,7 +117,13 @@ class FleetConfig:
         priority_levels: Number of priority levels (0 = highest).
         vlm_budget_ms: Per-request VLM latency budget.
         action_head_budget_ms: Per-request action head latency budget.
-        max_stale_frames: Max consecutive frames allowed with a stale embedding.
+        max_head_batch: Most rows in one predict_batch call (ADR-022); 1
+            disables head batching and restores encode → head per request.
+        admission: Load-adaptive replan threshold and admission (ADR-023);
+            None leaves both to the clients and ``max_robots``.
+
+    How long a reused condition stays usable is not configured here: it is the
+    policy's calibrated PolicyCapabilities.max_condition_staleness_ms.
     """
 
     max_robots: int = 8
@@ -87,7 +131,12 @@ class FleetConfig:
     priority_levels: int = 3
     vlm_budget_ms: float = 200.0
     action_head_budget_ms: float = 50.0
-    max_stale_frames: int = 5
+    max_head_batch: int = 8
+    admission: Optional[AdmissionConfig] = None
+
+    def __post_init__(self) -> None:
+        if self.max_head_batch < 1:
+            raise ValueError(f"max_head_batch must be >= 1, got {self.max_head_batch}")
 
 
 # ── Robot registration record ─────────────────────────────────────────────────
@@ -101,8 +150,8 @@ class RobotSlot:
         action_head: Independent ActionHeadRuntime instance.
         priority: Default scheduling priority (0 = highest).
         budget_manager: Per-robot budget tracker.
-        last_embedding: Last successfully produced embedding (for stale fallback).
-        stale_frames: Consecutive frames using a stale embedding.
+        last_embedding: Last successfully produced condition (for stale fallback).
+        stale_frames: Consecutive VLM-timeout frames (observability only).
         registered_at: Wall-clock timestamp of registration.
     """
 
@@ -135,6 +184,17 @@ class _QueueItem:
     request: ActionRequest = field(compare=False)
     robot_id: str = field(compare=False)
     handle: "RequestHandle" = field(compare=False)
+    head_context: Optional[ActionHeadContext] = field(default=None, compare=False)
+
+
+@dataclass
+class _ReadyItem:
+    """An encoded request waiting for the head stage."""
+
+    item: _QueueItem
+    slot: RobotSlot
+    embedding: Embedding
+    ready_at: float  # perf_counter when the condition became available
 
 
 # ── Fleet scheduler ───────────────────────────────────────────────────────────
@@ -144,15 +204,19 @@ class FleetScheduler:
 
     Args:
         vlm_backend: Shared VLM backend (vLLM, SGLang, llama.cpp, etc.).
+        capabilities: What the served policy supports (ADR-018).
         config: Fleet configuration.
     """
 
     def __init__(
         self,
         vlm_backend: VLMBackend,
+        capabilities: PolicyCapabilities,
         config: FleetConfig | None = None,
     ) -> None:
         self._vlm = vlm_backend
+        self._caps = capabilities
+        self._policy: Optional["Policy"] = None
         self._config = config or FleetConfig()
         self._robots: dict[str, RobotSlot] = {}
         self._lock = asyncio.Lock()
@@ -169,6 +233,33 @@ class FleetScheduler:
         self._dispatch_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # Head calls and the rows they served (mean head batch size).
+        self._head_calls = 0
+        self._head_rows = 0
+
+        self._admission = (
+            AdmissionController(self._config.admission) if self._config.admission else None
+        )
+
+    @classmethod
+    def from_policy(
+        cls,
+        policy: "Policy",
+        config: FleetConfig | None = None,
+    ) -> "FleetScheduler":
+        """Build a fleet serving one validated Policy.
+
+        Robots registered without an explicit head get one spawned from the
+        policy's prototype: shared weights, private state (ADR-012 ③).
+        """
+        fleet = cls(
+            vlm_backend=policy.vlm_backend,
+            capabilities=policy.capabilities,
+            config=config,
+        )
+        fleet._policy = policy
+        return fleet
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -178,7 +269,12 @@ class FleetScheduler:
         self._dispatch_task = asyncio.create_task(
             self._dispatch_loop(), name="fleet_dispatch"
         )
-        _tracer.event("fleet_started", max_robots=self._config.max_robots)
+        _tracer.event(
+            "fleet_started",
+            max_robots=self._config.max_robots,
+            frequency_mode=self._caps.effective_frequency_mode,
+            staleness_uncalibrated=not self._caps.staleness_calibrated,
+        )
 
     async def stop(self) -> None:
         """Gracefully shut down the fleet dispatcher and VLM backend."""
@@ -198,23 +294,55 @@ class FleetScheduler:
     async def register_robot(
         self,
         robot_id: str,
-        action_head: ActionHeadRuntime,
+        action_head: Optional[ActionHeadRuntime] = None,
         priority: int = 1,
     ) -> None:
         """Register a robot with its dedicated action head instance.
 
         Args:
             robot_id: Unique identifier (e.g. "robot_0", "arm_left").
-            action_head: Independent ActionHeadRuntime for this robot.
-                Must NOT be shared with another registered robot.
+            action_head: This robot's head instance. The instance must not be
+                registered for another robot — it carries per-robot state —
+                though it may share weights with other instances (spawn()).
+                Omit it on a fleet built with from_policy() to spawn one from
+                the policy's prototype.
             priority: Default request priority (0 = highest).
 
         Raises:
-            ValueError: If robot_id is already registered or max_robots exceeded.
+            ValueError: If robot_id is already registered, the head instance
+                is already registered for another robot, or no head was given
+                on a fleet without a policy.
+            EdgeResourceError: If max_robots would be exceeded.
+            BudgetExceededError: If admission control predicts the fleet's
+                round latency with this robot above ``admit_latency_ms``.
+            PolicyCapabilityError: If the policy declares supports_rtc and the
+                head does not implement RealTimeChunkingHead.
         """
+        if action_head is None:
+            if self._policy is None:
+                raise ValueError(
+                    f"register_robot({robot_id!r}) needs an action_head; only a fleet "
+                    "built with from_policy() can spawn one"
+                )
+            action_head = self._policy.head_for_robot()
+        if self._caps.supports_rtc and not head_supports_rtc(action_head):
+            raise PolicyCapabilityError(
+                f"capabilities declare supports_rtc but {type(action_head).__name__} "
+                "does not implement RealTimeChunkingHead",
+                ErrorContext(
+                    trace_id=_tracer.trace_id, module_name="serving.fleet", request_id=robot_id
+                ),
+            )
         async with self._lock:
             if robot_id in self._robots:
                 raise ValueError(f"Robot '{robot_id}' is already registered")
+            for other in self._robots.values():
+                if other.action_head is action_head:
+                    raise ValueError(
+                        f"this action head instance is already registered for "
+                        f"{other.robot_id!r}; give each robot its own instance "
+                        "(spawn() shares weights without sharing state)"
+                    )
             if len(self._robots) >= self._config.max_robots:
                 raise EdgeResourceError(
                     required_mb=0.0,
@@ -225,6 +353,7 @@ class FleetScheduler:
                         request_id=robot_id,
                     ),
                 )
+            self._check_admission(robot_id, len(self._robots) + 1)
             self._robots[robot_id] = RobotSlot(
                 robot_id=robot_id,
                 action_head=action_head,
@@ -232,6 +361,7 @@ class FleetScheduler:
             )
         _metrics.gauge("fleet_registered_robots", len(self._robots))
         _tracer.event("robot_registered", robot_id=robot_id, priority=priority)
+        self._update_admission()
 
     async def deregister_robot(self, robot_id: str) -> None:
         """Remove a robot from the fleet.
@@ -245,6 +375,54 @@ class FleetScheduler:
             self._robots.pop(robot_id, None)
         _metrics.gauge("fleet_registered_robots", len(self._robots))
         _tracer.event("robot_deregistered", robot_id=robot_id)
+        self._update_admission()
+
+    # ── Admission control (ADR-023) ───────────────────────────────────────────
+
+    @property
+    def replan_threshold(self) -> Optional[float]:
+        """The replan threshold admission control advises; None without admission."""
+        return None if self._admission is None else self._admission.threshold
+
+    def _check_admission(self, robot_id: str, num_robots: int) -> None:
+        if self._admission is None:
+            return
+        admitted, predicted = self._admission.admits(num_robots)
+        if admitted:
+            return
+        limit = self._admission.config.admit_latency_ms
+        _metrics.increment("fleet_admission_rejected")
+        _tracer.event(
+            "fleet_admission_rejected",
+            robot_id=robot_id,
+            num_robots=num_robots,
+            predicted_round_ms=round(predicted, 1),
+            admit_latency_ms=limit,
+        )
+        raise BudgetExceededError(
+            predicted,
+            limit,
+            ErrorContext(
+                trace_id=_tracer.trace_id, module_name="serving.fleet", request_id=robot_id
+            ),
+        )
+
+    def _update_admission(self) -> None:
+        if self._admission is None:
+            return
+        change = self._admission.update(len(self._robots))
+        if change is None:
+            return
+        _metrics.gauge("fleet_replan_threshold", change.threshold)
+        _tracer.event(
+            "fleet_admission_level",
+            level=change.level,
+            replan_threshold=change.threshold,
+            num_robots=change.num_robots,
+            predicted_round_ms=round(change.predicted_round_ms, 1),
+            vlm_ms=round(self._admission.vlm_ms or 0.0, 2),
+            head_ms=round(self._admission.head_estimate(change.num_robots) or 0.0, 2),
+        )
 
     # ── Request submission ────────────────────────────────────────────────────
 
@@ -253,13 +431,20 @@ class FleetScheduler:
         robot_id: str,
         request: ActionRequest,
         priority_override: int | None = None,
+        head_context: ActionHeadContext | None = None,
     ) -> RequestHandle:
         """Submit an inference request for a registered robot.
+
+        The fleet keeps no chunk buffer — each robot's client executes its own
+        — so an RTC policy's guidance context comes from the caller, snapshotted
+        when the observation was taken (ADR-015). Without one the head samples
+        unguided.
 
         Args:
             robot_id: Which robot this request belongs to.
             request: ActionRequest with image + instruction + robot_state.
             priority_override: Override the robot's default priority.
+            head_context: RTC context from the robot's chunk buffer.
 
         Returns:
             RequestHandle for streaming results via fleet.stream().
@@ -267,10 +452,21 @@ class FleetScheduler:
         Raises:
             KeyError: If robot_id is not registered.
             EdgeResourceError: If the VLM queue is full (back-pressure).
+            PolicyCapabilityError: If ``head_context`` is given for a policy
+                that does not declare supports_rtc.
         """
         slot = self._robots.get(robot_id)
         if slot is None:
             raise KeyError(f"Robot '{robot_id}' is not registered")
+        if head_context is not None and not self._caps.supports_rtc:
+            raise PolicyCapabilityError(
+                "an RTC head_context was given but the policy does not declare supports_rtc",
+                ErrorContext(
+                    trace_id=_tracer.trace_id,
+                    module_name="serving.fleet",
+                    request_id=request.request_id,
+                ),
+            )
 
         priority = priority_override if priority_override is not None else slot.priority
 
@@ -285,6 +481,7 @@ class FleetScheduler:
             request=request,
             robot_id=robot_id,
             handle=handle,
+            head_context=head_context,
         )
 
         async with self._heap_lock:
@@ -358,33 +555,56 @@ class FleetScheduler:
         if handle.error is not None:
             raise handle.error
 
-    # ── Dispatch loop (shared VLM) ────────────────────────────────────────────
+    # ── Dispatch loop (shared VLM, then the head stage) ───────────────────────
 
     async def _dispatch_loop(self) -> None:
-        """Background task: drain the priority heap, call shared VLM, dispatch to action heads."""
+        """Background task: encode queued requests, then run their heads (ADR-022)."""
         while self._running:
             await self._queue_event.wait()
             self._queue_event.clear()
 
-            while True:
-                async with self._heap_lock:
-                    if not self._heap:
+            ready: list[_ReadyItem] = []
+            try:
+                while True:
+                    item = await self._pop()
+                    if item is not None:
+                        entry = await self._encode_item(item)
+                        if entry is not None:
+                            ready.append(entry)
+                        if not ready or await self._encode_more(ready):
+                            continue
+                    if not ready:
                         break
-                    item = heapq.heappop(self._heap)
-                    _metrics.gauge("fleet_queue_depth", len(self._heap))
+                    batch, ready = ready, []
+                    await self._run_heads(batch)
+            except asyncio.CancelledError:
+                for entry in ready:
+                    entry.item.handle._done.set()
+                raise
 
-                # One request must never take down the fleet. An escaping
-                # exception would kill this task, leaving every in-flight and
-                # future handle unresolved and every stream() spinning forever
-                # with no signal — so failures are contained per item and the
-                # handle is always released.
-                try:
-                    await self._process_item(item)
-                except asyncio.CancelledError:
-                    item.handle._done.set()
-                    raise
-                except Exception as exc:  # noqa: BLE001 - isolation boundary
-                    self._fail_item(item, exc)
+    async def _pop(self) -> Optional[_QueueItem]:
+        async with self._heap_lock:
+            if not self._heap:
+                return None
+            item = heapq.heappop(self._heap)
+            _metrics.gauge("fleet_queue_depth", len(self._heap))
+            return item
+
+    async def _encode_more(self, ready: list[_ReadyItem]) -> bool:
+        """Whether to encode the next queued request before running the ready heads.
+
+        Only when its head would join the same batch: encoding it first costs
+        the ready rows one VLM pass and saves it a whole head call.
+        """
+        if len(ready) >= self._config.max_head_batch:
+            return False
+        async with self._heap_lock:
+            if not self._heap:
+                return False
+            nxt = self._robots.get(self._heap[0].robot_id)
+        return nxt is not None and heads_batch_together(
+            ready[0].slot.action_head, nxt.action_head
+        )
 
     def _fail_item(self, item: _QueueItem, error: Exception) -> None:
         """Record a failed request and release its handle so stream() terminates.
@@ -404,46 +624,75 @@ class FleetScheduler:
             error=str(error),
         )
 
-    async def _process_item(self, item: _QueueItem) -> None:
-        """Process one queued request: VLM encode → action head predict."""
+    async def _encode_item(self, item: _QueueItem) -> Optional[_ReadyItem]:
+        """VLM stage for one request; None when it ends here (failed, held, dropped)."""
         slot = self._robots.get(item.robot_id)
         if slot is None:
             # Robot deregistered while request was queued — discard
             item.handle._done.set()
-            return
+            return None
 
-        with _tracer.span(
-            "fleet_process",
-            robot_id=item.robot_id,
-            request_id=item.request.request_id,
-            priority=item.priority,
-        ):
-            embedding = await self._vlm_encode(item, slot)
-            await self._action_generate(embedding, item, slot)
+        # One request must never take down the fleet. An escaping exception
+        # would kill the dispatch task, leaving every in-flight and future
+        # handle unresolved and every stream() spinning forever with no
+        # signal — so failures are contained per item and the handle is
+        # always released.
+        try:
+            with _tracer.span(
+                "fleet_vlm_stage",
+                robot_id=item.robot_id,
+                request_id=item.request.request_id,
+                priority=item.priority,
+            ):
+                embedding = await self._vlm_encode(item, slot)
+        except asyncio.CancelledError:
+            item.handle._done.set()
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolation boundary
+            self._fail_item(item, exc)
+            return None
+        if embedding is None:
+            return None
+        return _ReadyItem(item=item, slot=slot, embedding=embedding, ready_at=time.perf_counter())
 
     async def _vlm_encode(
         self,
         item: _QueueItem,
         slot: RobotSlot,
-    ) -> Embedding:
-        """Shared VLM encode with timeout and stale-embedding fallback."""
+    ) -> Optional[Embedding]:
+        """Shared VLM encode with timeout fallback.
+
+        Returns:
+            The condition for the head, or None when a coupled policy timed
+            out and the robot should keep executing its queued tail.
+        """
         t0 = time.perf_counter()
         budget_s = self._config.vlm_budget_ms / 1000.0
+        request = item.request
+        state_for_backbone = request.robot_state if self._caps.state_to_backbone else None
+        ctx = ErrorContext(
+            trace_id=_tracer.trace_id,
+            module_name="serving.fleet",
+            request_id=request.request_id,
+        )
 
         try:
-            embedding = await asyncio.wait_for(
-                self._vlm.encode(item.request.image, item.request.instruction),
+            embedding: Optional[Embedding] = await asyncio.wait_for(
+                self._vlm.encode(request.images, request.instruction, state_for_backbone),
                 timeout=budget_s,
             )
+            self._caps.check_condition(embedding, ctx)
             slot.last_embedding = embedding
             slot.stale_frames = 0
 
         except (asyncio.TimeoutError, VLMTimeoutError):
-            embedding = await self._on_vlm_timeout(item, slot)
             _metrics.increment("fleet_vlm_timeout")
+            embedding = await self._on_vlm_timeout(item, slot)
 
         vlm_ms = (time.perf_counter() - t0) * 1000.0
         slot.budget_manager.record("vlm", vlm_ms, request_id=item.request.request_id)
+        if self._admission is not None and slot.stale_frames == 0:
+            self._admission.record_vlm(vlm_ms)
         _tracer.event(
             "fleet_vlm_encoded",
             robot_id=item.robot_id,
@@ -456,14 +705,19 @@ class FleetScheduler:
         self,
         item: _QueueItem,
         slot: RobotSlot,
-    ) -> Embedding:
-        """Per-robot stale-embedding fallback (mirrors AsyncScheduler logic)."""
+    ) -> Optional[Embedding]:
+        """Per-robot VLM-timeout fallback (mirrors AsyncScheduler logic).
+
+        Raises:
+            VLMTimeoutError: No prior condition for this robot.
+            EmbeddingStaleError: Decoupled policy, last condition too old.
+        """
+        ctx = ErrorContext(
+            trace_id=_tracer.trace_id,
+            module_name="serving.fleet",
+            request_id=item.request.request_id,
+        )
         if slot.last_embedding is None:
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="serving.fleet",
-                request_id=item.request.request_id,
-            )
             raise VLMTimeoutError(
                 timeout_ms=self._config.vlm_budget_ms,
                 budget_ms=self._config.vlm_budget_ms,
@@ -471,72 +725,155 @@ class FleetScheduler:
             )
 
         slot.stale_frames += 1
-        if slot.stale_frames > self._config.max_stale_frames:
-            from vla_runtime.errors import EmbeddingStaleError
-            ctx = ErrorContext(
-                trace_id=_tracer.trace_id,
-                module_name="serving.fleet",
-                request_id=item.request.request_id,
-            )
-            raise EmbeddingStaleError(
+        if self._caps.effective_frequency_mode == "coupled":
+            item.handle.degraded = "vlm_timeout_hold_tail"
+            item.handle._done.set()
+            _tracer.event(
+                "fleet_vlm_timeout_hold_tail",
+                robot_id=item.robot_id,
                 stale_frames=slot.stale_frames,
-                max_stale_frames=self._config.max_stale_frames,
-                context=ctx,
             )
+            return None
+
+        max_age_ms = self._caps.max_condition_staleness_ms
+        if max_age_ms is not None and slot.last_embedding.is_stale(max_age_ms):
+            raise EmbeddingStaleError(slot.last_embedding.age_ms, max_age_ms, ctx)
 
         _tracer.event(
             "fleet_stale_embedding",
             robot_id=item.robot_id,
             stale_frames=slot.stale_frames,
+            embedding_age_ms=round(slot.last_embedding.age_ms, 1),
         )
         return slot.last_embedding
 
-    async def _action_generate(
-        self,
-        embedding: Embedding,
-        item: _QueueItem,
-        slot: RobotSlot,
-    ) -> None:
-        """Per-robot action head prediction (fully isolated state)."""
-        import torch
-        from vla_runtime.action_head.base import RobotState
+    # ── Head stage ────────────────────────────────────────────────────────────
 
-        robot_state_tensor = item.request.robot_state
-        half = robot_state_tensor.shape[0] // 2
-        robot_state = RobotState(
-            joint_positions=robot_state_tensor[:half],
-            joint_velocities=robot_state_tensor[half:],
-            gripper_state=robot_state_tensor[-1:],
-        )
+    async def _run_heads(self, batch: list[_ReadyItem]) -> None:
+        """Run the ready rows: batchable heads together, the rest one by one."""
+        groups: list[list[_ReadyItem]] = []
+        for entry in batch:
+            for group in groups:
+                if len(group) < self._config.max_head_batch and heads_batch_together(
+                    group[0].slot.action_head, entry.slot.action_head
+                ):
+                    group.append(entry)
+                    break
+            else:
+                groups.append([entry])
+        done = 0
+        try:
+            for group in groups:
+                if len(group) == 1:
+                    await self._head_single(group[0])
+                else:
+                    await self._head_batch(group)
+                done += 1
+        except asyncio.CancelledError:
+            for group in groups[done:]:
+                for entry in group:
+                    entry.item.handle._done.set()
+            raise
 
+    def _head_context(self, entry: _ReadyItem) -> Optional[ActionHeadContext]:
+        return entry.item.head_context if self._caps.supports_rtc else None
+
+    async def _head_single(self, entry: _ReadyItem) -> None:
+        """Per-robot predict(); failures are contained to this request."""
         t0 = time.perf_counter()
         try:
-            loop = asyncio.get_event_loop()
-            chunk = await loop.run_in_executor(
-                None,
-                lambda: slot.action_head.predict(embedding, robot_state),
+            chunk = await self._predict_one(entry)
+        except Exception as exc:  # noqa: BLE001 - isolation boundary
+            self._fail_item(entry.item, exc)
+            return
+        self._head_calls += 1
+        self._head_rows += 1
+        if self._admission is not None:
+            self._admission.record_head(1, (time.perf_counter() - t0) * 1000.0)
+        await self._deliver(entry, chunk, t0, batch_size=1)
+
+    async def _predict_one(self, entry: _ReadyItem) -> ActionChunk:
+        """Per-robot action head prediction (fully isolated state)."""
+        import torch
+
+        head = entry.slot.action_head
+        robot_state = entry.item.request.robot_state
+        loop = asyncio.get_running_loop()
+        try:
+            if self._caps.supports_rtc:
+                context = self._head_context(entry)
+                return await loop.run_in_executor(
+                    None, lambda: head.predict(entry.embedding, robot_state, context)
+                )
+            return await loop.run_in_executor(
+                None, lambda: head.predict(entry.embedding, robot_state)
             )
         except ActionHeadFailureError as exc:
             _tracer.event(
                 "fleet_action_head_failure",
-                robot_id=item.robot_id,
+                robot_id=entry.item.robot_id,
                 error=str(exc),
             )
-            zero = torch.zeros(
-                slot.action_head.chunk_size,
-                slot.action_head.action_dim,
-                dtype=torch.float16,
-            )
-            chunk = ActionChunk(
+            zero = torch.zeros(head.chunk_size, head.action_dim, dtype=torch.float16)
+            return ActionChunk(
                 actions=zero,
-                head_type=slot.action_head.head_type,
+                head_type=head.head_type,
                 metadata={"fallback": True, "reason": str(exc)},
             )
 
+    async def _head_batch(self, group: list[_ReadyItem]) -> None:
+        """One predict_batch over rows whose heads share weights (ADR-022).
+
+        A failed batch is retried row by row, so one bad row fails only itself.
+        """
+        head = group[0].slot.action_head
+        embeddings = [entry.embedding for entry in group]
+        states = [entry.item.request.robot_state for entry in group]
+        contexts = [self._head_context(entry) for entry in group]
+        loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
+        try:
+            chunks = await loop.run_in_executor(
+                None, lambda: head.predict_batch(embeddings, states, contexts)
+            )
+            if len(chunks) != len(group):
+                raise ValueError(
+                    f"predict_batch returned {len(chunks)} chunks for {len(group)} rows"
+                )
+        except Exception as exc:  # noqa: BLE001 - fall back to per-row isolation
+            _metrics.increment("fleet_head_batch_fallback")
+            _tracer.event(
+                "fleet_head_batch_fallback",
+                batch_size=len(group),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            for entry in group:
+                await self._head_single(entry)
+            return
+        self._head_calls += 1
+        self._head_rows += len(group)
+        head_ms = (time.perf_counter() - t0) * 1000.0
+        if self._admission is not None:
+            self._admission.record_head(len(group), head_ms)
+        _tracer.event("fleet_head_batch", batch_size=len(group), head_ms=round(head_ms, 2))
+        for entry, chunk in zip(group, chunks):
+            await self._deliver(entry, chunk, t0, batch_size=len(group))
+
+    async def _deliver(
+        self, entry: _ReadyItem, chunk: ActionChunk, t0: float, batch_size: int
+    ) -> None:
+        """Hand one row's chunk to its handle and record the head stage timing."""
+        item = entry.item
         action_ms = (time.perf_counter() - t0) * 1000.0
-        slot.budget_manager.record(
+        head_wait_ms = (t0 - entry.ready_at) * 1000.0
+        entry.slot.budget_manager.record(
             "action_head", action_ms, request_id=item.request.request_id
         )
+        chunk.metadata = {**chunk.metadata, "head_batch_size": batch_size}
+        if self._admission is not None:
+            self._update_admission()
+            chunk.metadata["replan_threshold"] = self._admission.threshold
 
         await item.handle._chunk_queue.put(chunk)
         item.handle._done.set()
@@ -547,6 +884,8 @@ class FleetScheduler:
             robot_id=item.robot_id,
             request_id=item.request.request_id,
             action_ms=round(action_ms, 2),
+            head_wait_ms=round(head_wait_ms, 2),
+            head_batch_size=batch_size,
         )
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
@@ -558,6 +897,11 @@ class FleetScheduler:
             "num_robots": len(self._robots),
             "queue_depth": len(self._heap),
             "running": self._running,
+            "head_calls": self._head_calls,
+            "mean_head_batch": (
+                round(self._head_rows / self._head_calls, 3) if self._head_calls else None
+            ),
+            "admission": None if self._admission is None else self._admission.snapshot(),
             "per_robot": {
                 rid: {
                     "priority": slot.priority,
