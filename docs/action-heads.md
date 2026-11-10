@@ -28,9 +28,9 @@ class ActionHeadRuntime(Protocol):
 
 Each robot gets its own head instance. State isolation is guaranteed by the caller giving each robot a separate object, not by locking inside the head, which keeps the heads free of synchronization entirely.
 
-Separate instances do not mean separate weights. The built-in heads and `TensorRTBackend` implement `WeightSharingHead`: `spawn()` returns a new instance that reads the same `SharedWeights` — one copy of the network, frozen in eval mode with gradients off. `load_weights()` and `to_device()` act on that shared copy, so they apply to every spawned instance and must not run while any of them is serving. `TensorRTBackend.spawn()` shares the compiled engine but creates a new execution context, since a context holds per-inference state.
+Separate instances do not mean separate weights; see `WeightSharingHead` below.
 
-A head must be able to read the condition kind its policy declares. The three built-in heads condition an MLP on a pooled vector, so they accept `kind="pooled"` only and reject anything else with a message naming the kind they received. A π0-style expert that attends over per-layer prefix K/V, or a GR00T-style head reading projected features, needs a head that implements that attention — the built-in heads are not stand-ins for it.
+A head must be able to read the condition kind its policy declares (`accepted_condition_kinds`). The reference head conditions an MLP on a pooled vector, so it accepts `kind="pooled"` only and rejects anything else with a message naming the kind it received. The prefix-KV expert accepts `per_layer_kv` only.
 
 `chunk_size` is the main lever on the latency-versus-freshness tradeoff. A larger chunk amortizes per-call overhead and gives the control loop more runway before it can underrun, but it also means actions at the end of the chunk were computed from an older observation.
 
@@ -67,64 +67,55 @@ class ActionChunk:
 
 `chunk_size` and `action_dim` are read off the tensor shape, and `step(i)` returns a single action. `metadata` carries head-specific detail — the number of denoising steps used, the sampler, whether the chunk was produced by a fallback path — which is what makes a trace readable after the fact.
 
-## The three paradigms
+## Optional capabilities
 
-The three action paradigms differ enough computationally that they are implemented independently rather than behind a shared abstraction. A discrete-token head decodes autoregressively; a flow matching head integrates an ODE; a diffusion head iteratively denoises. They share only the protocol.
+Three capabilities sit beside the core protocol rather than in it, so a third-party head that has none of them still satisfies `ActionHeadRuntime`. The schedulers check for each one and use it only when present.
 
-### Discrete tokens
+| Protocol | Methods | Used by |
+|---|---|---|
+| `WeightSharingHead` | `spawn()`, `shares_weights_with()` | `Policy.head_for_robot()` and `FleetScheduler.from_policy()`: every robot gets its own instance over one copy of the weights |
+| `RealTimeChunkingHead` | `supports_rtc`, `predict(..., context)` | Schedulers pass an `ActionHeadContext` (queued actions, inference delay) only when the policy declares `supports_rtc`; the head guides its denoising toward the committed prefix (`vla_runtime/action_head/rtc.py`) |
+| `BatchedActionHead` | `predict_batch(embeddings, robot_states, contexts)` | `FleetScheduler` runs every ready row of heads that share weights in one pass; each row keeps its own noise, condition, RTC context and output |
 
-Source: `vla_runtime/action_head/discrete_token.py`
+`spawn()` instances read the same weights, frozen in eval mode with gradients off. `load_weights()` and `to_device()` act on that shared copy, so they apply to every spawned instance and must not run while any of them is serving.
 
-Actions are quantized into a token vocabulary and predicted like text. Two components make this practical for control rates.
+## The shipped heads
 
-`FASTTokenizer` compresses an action chunk through a DCT basis before quantization, so a chunk becomes a short token sequence rather than one token per dimension per timestep. `encode()` maps `[chunk_size, action_dim]` to a token list and `decode()` inverts it.
-
-`OFTParallelDecoder` predicts the whole chunk in one forward pass instead of stepping autoregressively. Autoregressive decoding of an action chunk is the single largest latency contributor in a discrete-token VLA, and removing the sequential dependency is what brings this paradigm into control-loop range. Enable it with `use_oft=True`.
-
-The head supports both directions. With `use_oft=True`, `predict()` decodes the chunk directly from the embedding. Without it, the tokens come from the backbone's token stream, and the caller uses `predict_from_stream(token_stream, robot_state)` — which is the path that pairs with `VLMBackend.generate()`.
-
-### Flow matching
+### Reference flow-matching head
 
 Source: `vla_runtime/action_head/flow_matching.py`
 
-A velocity field is integrated from noise to an action chunk. `VelocityMLP` conditions on the concatenation of the current sample, time, the embedding, and the flat robot state.
+`FlowMatchingHead` integrates a velocity field from noise to an action chunk with a small MLP (`VelocityMLP`) conditioned on the current sample, time, a pooled embedding and the flat robot state. It is the head the unit tests and the mock sim policy use; it implements weight sharing and RTC, so scheduling, chunk stitching and guidance can be exercised without a model.
 
-Two integrators are available. Euler takes `n_steps` fixed steps and is the cheaper option. RK4 evaluates the field four times per step for a higher-order estimate, trading compute for accuracy at a given step count — worth it when `n_steps` is small enough that Euler's truncation error shows up in the trajectory. Select with `use_rk4`.
+Two integrators are available. Euler takes `n_steps` fixed steps. RK4 evaluates the field four times per step for a higher-order estimate. Select with `use_rk4`.
 
-Both call into the kernels in `kernels/flow_matching_step.py`, which are Triton on GPU and PyTorch elsewhere. See [Kernels](./kernels.md).
+### Prefix-KV action expert
 
-### Diffusion
+Source: `benchmarks/sim/lerobot_smolvla.py` (`PrefixKVExpertHead`)
 
-Source: `vla_runtime/action_head/diffusion.py`
+The π0.5 and SmolVLA action experts, run over the `per_layer_kv` condition from the prefix-KV backbone ([VLM backends](./vlm-backends.md)). The expert keeps no state between calls, so spawned instances share the one loaded model and any instance can serve a batch. It implements all three optional capabilities:
 
-Reverse diffusion from noise to an action chunk, with `NoisePredictorMLP` conditioning on sample, time, embedding, and flat state.
+- batched denoising: per-layer K/V stacked along the batch, shorter prefixes right-padded and masked;
+- RTC guidance inside its Euler loop;
+- for π0.5, optional replay of the unguided loop from CUDA Graphs captured per batch size (`benchmarks/sim/cuda_graph.py`).
 
-Two samplers are available. DDPM injects stochastic noise at each step and follows the training-time reverse process. DDIM is deterministic and reaches comparable quality in fewer steps, which is why it is the default — denoising step count is the dominant cost in this paradigm, and every step removed is latency returned to the control loop.
+The head is launch-bound. The π0.5 expert's 10 denoising steps take 84 ms eager and 33 ms replayed from a graph at batch 1, and a batch of four costs about the same as one row eager. That is why batching it across robots is nearly free.
 
-The noise schedule is cosine. Note that `ᾱ` is floored at `_ALPHA_BAR_MIN` rather than being allowed to reach its analytic value of zero at `t = 1`: every sampler divides the residual by `sqrt(ᾱ_t)` to recover the clean sample, so a true zero makes that amplification unbounded and overflows float16 to infinity on the very first reverse step. The floor is the same guard the improved-DDPM schedule gets from clipping β.
+## Paradigms
 
-## TensorRT wrapper
+`head_type` names the paradigm; it decides which `head_structure` a policy may declare (`vla_runtime/policy.py`) and which precision policy applies ([Quantization](./quantization.md)).
 
-Source: `vla_runtime/action_head/tensorrt_backend.py`
-
-`TensorRTBackend` wraps any head that satisfies the protocol, exporting it to ONNX and compiling a TensorRT engine. It satisfies the protocol itself, so it substitutes for the head it wraps without any change to the scheduler.
-
-`build_or_load_engine(example_inputs)` compiles on first use and loads a cached engine afterwards. The wrapper carries a precision guard: it will not compile a flow matching or diffusion head at a precision below what those paradigms tolerate, so an aggressive engine configuration fails at build time rather than producing a policy that quietly misses its target. See [Quantization](./quantization.md) for the precision policy this enforces.
-
-## Choosing a configuration
-
-| | Discrete token | Flow matching | Diffusion |
+| `head_type` | Example models | Structure | Cost driver |
 |---|---|---|---|
-| Cost driver | Decode steps, unless parallel decoding is on | Integration steps | Denoising steps |
-| Main lever | `use_oft` | `n_steps`, `use_rk4` | `n_steps`, `sampler` |
-| Precision tolerance | Tolerates modest quantization | Float16 | Float16 |
-| Needs the token path | Yes, unless using parallel decoding | No | No |
+| `flow_matching` | π0, π0.5, SmolVLA, GR00T N1.x | iterative | Integration steps × expert size |
+| `diffusion` | Diffusion Policy | iterative | Denoising steps |
+| `discrete_token` | OpenVLA, π0-FAST | single pass or monolithic | Decode steps (autoregressive action tokens) |
 
-The precision column is the one that constrains deployment. Flow matching and diffusion are iterative: each step's error feeds the next, so quantization error compounds over the trajectory rather than averaging out. A discrete-token head makes one classification decision per token and is far more forgiving. This is why the runtime allows aggressive compression of the backbone but not of an iterative head — the details are in [Quantization](./quantization.md).
+Only `flow_matching` heads are integrated today. Iterative heads are the ones the runtime can guide (RTC) and batch.
 
 ## Related documents
 
 - [Architecture](./architecture.md) — where action generation sits in the pipeline
 - [Scheduler](./scheduler.md) — how chunks are stitched into a continuous trajectory
-- [Kernels](./kernels.md) — the Triton kernels the iterative heads call
+- [Fleet serving](./fleet-serving.md) — how heads are batched across robots
 - [Quantization](./quantization.md) — precision constraints and how they are validated
