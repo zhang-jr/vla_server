@@ -1,7 +1,7 @@
 """Test-wide configuration.
 
-Tests marked ``@pytest.mark.gpu`` need a CUDA device (kernels are never
-mocked). They are skipped where none is visible, so the CPU suite stays
+Tests marked ``@pytest.mark.gpu`` need a CUDA device (real models are
+never mocked). They are skipped where none is visible, so the CPU suite stays
 runnable on any machine; run them on a CUDA host with ``pytest -m gpu``.
 """
 

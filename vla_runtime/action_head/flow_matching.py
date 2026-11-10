@@ -1,8 +1,12 @@
 """Flow Matching action head runtime.
 
 Implements Euler and RK4 integration for flow matching-based VLA models
-(Pi0, SmolVLA style). Uses the Triton kernel in kernels/flow_matching_step.py
-for the inner integration loop.
+(Pi0, SmolVLA style) around a small MLP velocity net. It is the reference head
+for unit tests and the mock sim policy; real models (π0.5, SmolVLA) run their
+own expert through the prefix-KV adapters in ``benchmarks/sim``.
+
+The integration update itself is a single elementwise op; its cost is in the
+velocity net, which CUDA Graphs address (ADR-021), so no custom kernel is used.
 
 Quantization constraint (ADR-003):
     This head MUST run in FP16. Iterative denoising accumulates numerical
@@ -19,11 +23,11 @@ Architecture (simplified):
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 
-from kernels.flow_matching_step import flow_matching_euler_step, flow_matching_rk4_step
 from vla_runtime.action_head.base import (
     ActionChunk,
     ActionHeadContext,
@@ -38,6 +42,22 @@ from vla_runtime.observability.tracer import get_tracer
 from vla_runtime.vlm.base import Embedding
 
 _tracer = get_tracer("action_head.flow_matching")
+
+VelocityFn = Callable[[torch.Tensor, float], torch.Tensor]
+
+
+def euler_step(z: torch.Tensor, velocity: torch.Tensor, dt: float) -> torch.Tensor:
+    """One explicit Euler step: z + dt * v."""
+    return z + velocity * dt
+
+
+def rk4_step(z: torch.Tensor, velocity_fn: VelocityFn, t: float, dt: float) -> torch.Tensor:
+    """One classical Runge-Kutta step (four velocity evaluations)."""
+    k1 = velocity_fn(z, t)
+    k2 = velocity_fn(euler_step(z, k1, dt / 2), t + dt / 2)
+    k3 = velocity_fn(euler_step(z, k2, dt / 2), t + dt / 2)
+    k4 = velocity_fn(euler_step(z, k3, dt), t + dt)
+    return euler_step(z, (k1 + 2.0 * k2 + 2.0 * k3 + k4) * (1.0 / 6.0), dt)
 
 
 class VelocityMLP(nn.Module):
@@ -277,10 +297,10 @@ class FlowMatchingHead:
 
         if self._use_rk4:
             for t in times:
-                z = flow_matching_rk4_step(z, vel_fn, t, dt)
+                z = rk4_step(z, vel_fn, t, dt)
         else:
             for t in times:
-                z = flow_matching_euler_step(z, vel_fn(z, t), dt)
+                z = euler_step(z, vel_fn(z, t), dt)
 
         return z  # [chunk_size, action_dim]
 

@@ -1,11 +1,7 @@
-"""Unit tests for quantization calibration and validation (Phase 2).
+"""Unit tests for the sim task-success-rate validator (ADR-008).
 
-All tests run without GPU — mock modules and sim environments are used.
+All tests run without GPU — mock policies and sim environments are used.
 Tests verify:
-  - CalibrationConfig seed isolation
-  - Per-module calibrators handle fp16 (no-op) correctly
-  - VLACalibrationPipeline orchestration
-  - ADR-003 enforcement: flow_matching/diffusion head cannot use non-fp16
   - TaskSuccessRateValidator pass / fail logic
   - PrecisionDegradationError raised on excessive drop
   - MockSimEnvironment determinism
@@ -16,17 +12,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
 
 from vla_runtime.errors import PrecisionDegradationError
-from vla_runtime.quantization.calibration import (
-    CalibrationConfig,
-    CalibrationSample,
-    VLACalibrationPipeline,
-    _collect_samples,
-    _seed_everything,
-)
-from vla_runtime.quantization.config import QuantizationConfig
 from vla_runtime.quantization.validation import (
     MockPolicy,
     MockSimEnvironment,
@@ -34,153 +21,6 @@ from vla_runtime.quantization.validation import (
     TaskSuccessRateValidator,
     validate_quantization_config,
 )
-
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-def _sample_iter(n: int = 20):
-    """Generate n deterministic calibration samples."""
-    for i in range(n):
-        yield CalibrationSample(
-            image=torch.zeros(3, 64, 64),
-            instruction=f"task {i}",
-            robot_state=torch.zeros(14),
-        )
-
-
-def _tiny_module() -> nn.Module:
-    return nn.Sequential(nn.Linear(16, 16))
-
-
-# ── CalibrationConfig ─────────────────────────────────────────────────────────
-
-def test_calibration_config_defaults():
-    cfg = CalibrationConfig()
-    assert cfg.num_samples == 512
-    assert cfg.seed == 42
-    assert cfg.batch_size == 8
-
-
-def test_seed_everything_reproducibility():
-    _seed_everything(42)
-    a = torch.rand(4)
-    _seed_everything(42)
-    b = torch.rand(4)
-    assert torch.allclose(a, b), "Same seed must produce same random values"
-
-
-def test_collect_samples_exact():
-    samples = _collect_samples(_sample_iter(20), num_samples=10)
-    assert len(samples) == 10
-
-
-def test_collect_samples_partial():
-    """If iterator has fewer samples than requested, collect all available."""
-    samples = _collect_samples(_sample_iter(5), num_samples=100)
-    assert len(samples) == 5
-
-
-def test_collect_samples_empty_raises():
-    with pytest.raises(ValueError, match="empty"):
-        _collect_samples(iter([]), num_samples=10)
-
-
-# ── VLACalibrationPipeline ────────────────────────────────────────────────────
-
-def test_pipeline_fp16_no_op():
-    """Full FP16 config should return modules unchanged (no-op calibration)."""
-    pipeline = VLACalibrationPipeline(
-        config=CalibrationConfig(num_samples=10, device="cpu")
-    )
-    m = _tiny_module()
-    result = pipeline.calibrate(
-        vision_module=m,
-        llm_module=m,
-        action_head_module=m,
-        head_type="flow_matching",
-        quant_config=QuantizationConfig.full_precision(),
-        calibration_data=lambda: _sample_iter(10),
-    )
-    assert result.vision.scheme == "fp16"
-    assert result.llm.scheme == "fp16"
-    assert result.action_head.scheme == "fp16"
-    assert result.vision.num_samples_used == 0
-    assert result.vision.calibration_ms == 0.0
-    assert "fp16" in result.summary()
-
-
-def test_pipeline_timing():
-    """total_ms should be ≥ sum of individual module times."""
-    pipeline = VLACalibrationPipeline(
-        config=CalibrationConfig(num_samples=5, device="cpu")
-    )
-    m = _tiny_module()
-    result = pipeline.calibrate(
-        vision_module=m,
-        llm_module=m,
-        action_head_module=m,
-        head_type="discrete_token",
-        quant_config=QuantizationConfig.full_precision(),
-        calibration_data=lambda: _sample_iter(5),
-    )
-    per_module = (
-        result.vision.calibration_ms
-        + result.llm.calibration_ms
-        + result.action_head.calibration_ms
-    )
-    assert result.total_ms >= per_module - 1.0
-
-
-def test_pipeline_adr003_flow_matching_fp16_only():
-    """ADR-003: flow_matching head with w8a16 must raise PrecisionDegradationError."""
-    pipeline = VLACalibrationPipeline(
-        config=CalibrationConfig(num_samples=5, device="cpu")
-    )
-    m = _tiny_module()
-    with pytest.raises(PrecisionDegradationError):
-        pipeline.calibrate(
-            vision_module=m,
-            llm_module=m,
-            action_head_module=m,
-            head_type="flow_matching",
-            quant_config=QuantizationConfig(action_head="w8a16"),
-            calibration_data=lambda: _sample_iter(5),
-        )
-
-
-def test_pipeline_adr003_diffusion_fp16_only():
-    """ADR-003: diffusion head with w8a16 must raise PrecisionDegradationError."""
-    pipeline = VLACalibrationPipeline(
-        config=CalibrationConfig(num_samples=5, device="cpu")
-    )
-    m = _tiny_module()
-    with pytest.raises(PrecisionDegradationError):
-        pipeline.calibrate(
-            vision_module=m,
-            llm_module=m,
-            action_head_module=m,
-            head_type="diffusion",
-            quant_config=QuantizationConfig(action_head="w8a16"),
-            calibration_data=lambda: _sample_iter(5),
-        )
-
-
-def test_pipeline_discrete_token_allows_w8a16():
-    """ADR-003: discrete_token head MAY use w8a16."""
-    pipeline = VLACalibrationPipeline(
-        config=CalibrationConfig(num_samples=5, device="cpu")
-    )
-    m = _tiny_module()
-    # Should not raise
-    result = pipeline.calibrate(
-        vision_module=m,
-        llm_module=m,
-        action_head_module=m,
-        head_type="discrete_token",
-        quant_config=QuantizationConfig(action_head="w8a16"),
-        calibration_data=lambda: _sample_iter(5),
-    )
-    assert result.action_head.scheme == "w8a16"
 
 
 # ── MockSimEnvironment ────────────────────────────────────────────────────────

@@ -3,7 +3,6 @@
 Coverage:
 - spawn(): new instance, same weights; group-wide load_weights / to_device
 - Shared weights are frozen for inference (eval mode, no grad)
-- TensorRTBackend.spawn(): engine shared, execution context per instance
 - Policy construction-time validation (condition kind, head structure)
 - AsyncScheduler.from_policy / FleetScheduler.from_policy
 - Fleet refuses one head instance registered for two robots
@@ -17,10 +16,7 @@ import pytest
 import torch
 
 from vla_runtime.action_head.base import WeightSharingHead
-from vla_runtime.action_head.diffusion import DiffusionHead
-from vla_runtime.action_head.discrete_token import DiscreteTokenHead
 from vla_runtime.action_head.flow_matching import FlowMatchingHead
-from vla_runtime.action_head.tensorrt_backend import TensorRTBackend
 from vla_runtime.capabilities import PolicyCapabilities
 from vla_runtime.policy import Policy, PolicyConfigurationError
 from vla_runtime.scheduler.async_scheduler import AsyncScheduler
@@ -61,6 +57,18 @@ class _PooledVLM:
         pass
 
 
+class _DiscreteHead:
+    """A single-pass discrete-token head; only its paradigm matters here."""
+
+    head_type = "discrete_token"
+    frequency_hz = 10.0
+    chunk_size = 4
+    action_dim = DOF
+
+    def predict(self, embedding, robot_state):
+        raise NotImplementedError
+
+
 class _NoSpawnHead:
     """A third-party head that satisfies the core Protocol but cannot share weights."""
 
@@ -82,23 +90,8 @@ class _NoSpawnHead:
 # ── Weight sharing ────────────────────────────────────────────────────────────
 
 class TestSpawn:
-    @pytest.mark.parametrize(
-        "make",
-        [
-            _flow_head,
-            lambda: DiffusionHead(
-                action_dim=DOF, chunk_size=4, embedding_dim=EMBED_DIM,
-                state_dim=STATE_DIM, n_steps=2,
-            ),
-            lambda: DiscreteTokenHead(
-                action_dim=DOF, chunk_size=4, embedding_dim=EMBED_DIM, use_oft=True
-            ),
-            lambda: DiscreteTokenHead(action_dim=DOF, chunk_size=4, embedding_dim=EMBED_DIM),
-        ],
-        ids=["flow", "diffusion", "discrete_oft", "discrete_no_weights"],
-    )
-    def test_spawn_is_a_new_instance_on_the_same_weights(self, make):
-        head = make()
+    def test_spawn_is_a_new_instance_on_the_same_weights(self):
+        head = _flow_head()
         clone = head.spawn()
         assert isinstance(head, WeightSharingHead)
         assert clone is not head
@@ -140,39 +133,6 @@ class TestSpawn:
         assert not any(p.requires_grad for p in net.parameters())
 
 
-class TestTensorRTSpawn:
-    def test_spawn_before_engine_build_shares_wrapped_weights(self, tmp_path):
-        trt = TensorRTBackend(_flow_head(), engine_path=tmp_path / "head.engine")
-        clone = trt.spawn()
-        assert clone is not trt
-        assert clone._wrapped is not trt._wrapped
-        assert clone.shares_weights_with(trt)
-        assert clone._context is None
-
-    def test_spawn_shares_engine_but_not_context(self, tmp_path):
-        class _Engine:
-            def create_execution_context(self):
-                return object()
-
-        trt = TensorRTBackend(_flow_head(), engine_path=tmp_path / "head.engine")
-        trt._engine = _Engine()
-        trt._context = trt._engine.create_execution_context()
-
-        clone = trt.spawn()
-        assert clone._engine is trt._engine
-        assert clone._context is not None and clone._context is not trt._context
-        assert clone.shares_weights_with(trt)
-
-    def test_spawn_requires_a_sharing_wrapped_head(self, tmp_path):
-        trt = TensorRTBackend(_NoSpawnHead(), engine_path=tmp_path / "head.engine")
-        with pytest.raises(TypeError, match="weight sharing"):
-            trt.spawn()
-
-    def test_delegates_accepted_condition_kinds(self, tmp_path):
-        trt = TensorRTBackend(_flow_head(), engine_path=tmp_path / "head.engine")
-        assert trt.accepted_condition_kinds == ("pooled",)
-
-
 # ── Policy validation ─────────────────────────────────────────────────────────
 
 class TestPolicy:
@@ -194,9 +154,8 @@ class TestPolicy:
             Policy("toy", caps, _PooledVLM(), _flow_head())
 
     def test_discrete_head_must_not_be_iterative(self):
-        head = DiscreteTokenHead(action_dim=DOF, chunk_size=4, embedding_dim=EMBED_DIM)
         with pytest.raises(PolicyConfigurationError, match="discrete_token"):
-            Policy("openvla", coupled_caps(), _PooledVLM(), head)
+            Policy("openvla", coupled_caps(), _PooledVLM(), _DiscreteHead())
 
     def test_head_without_spawn_cannot_be_multiplied(self):
         policy = Policy("third_party", coupled_caps(), _PooledVLM(), _NoSpawnHead())

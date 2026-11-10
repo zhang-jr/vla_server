@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vla-runtime"
 version = "0.1.0.dev0"
-description = "Model-agnostic VLA serving runtime — vLLM for VLA models"
+description = "Multi-robot policy serving for action-chunking VLA models"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -25,18 +25,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Cloud serving backends
-vllm = ["vllm>=0.4.0"]
-sglang = ["sglang>=0.1.0"]
-lmdeploy = ["lmdeploy>=0.4.0"]
-
-# Edge deployment
-edge = ["llama-cpp-python>=0.2.0"]
-
-# Kernel acceleration
-triton-dev = ["triton>=2.3.0"]
-tensorrt = ["tensorrt>=10.0"]
-
 # Closed-loop sim benchmarks (benchmarks/sim) — remote GPU host only.
 # SmolVLA comes from LeRobot (processor API, 0.4+); LIBERO via LeRobot's extra.
 sim-libero = ["lerobot[smolvla,libero]>=0.4"]
@@ -51,7 +39,7 @@ test = [
 
 # Full development environment
 dev = [
-    "vla-runtime[test,triton-dev]",
+    "vla-runtime[test]",
     "ruff>=0.4",
     "mypy>=1.9",
 ]
@@ -63,7 +51,7 @@ Repository = "https://github.com/youran-lab/vla-runtime"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vla_runtime*", "kernels*"]
+include = ["vla_runtime*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

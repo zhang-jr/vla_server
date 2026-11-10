@@ -211,10 +211,9 @@ class VLMBackend(Protocol):
     """Protocol that every VLM backend adapter must satisfy.
 
     Implementations:
-        - vllm_backend.VLLMBackend
-        - sglang_backend.SGLangBackend
-        - llamacpp_backend.LlamaCppBackend  (edge)
-        - lmdeploy_backend.LMDeployBackend
+        - PrefixKVBackbone (``benchmarks/sim/lerobot_smolvla.py``): runs the
+          π0.5 / SmolVLA VLM over the prefix in-process and returns its
+          per-layer K/V as a ``per_layer_kv`` condition
 
     All methods are async; the backend must not block the event loop.
     Robot state normally travels to ActionHeadRuntime as its own tensor channel.

@@ -10,8 +10,8 @@ SharedWeights (ADR-012 ③).
 Data flow:
     Embedding + RobotState → ActionHeadRuntime.predict() → ActionChunk
 
-Three head paradigms (from CLAUDE.md):
-    1. discrete_token  — OpenVLA, RT-2: FAST tokenizer + OFT parallel decode
+Three head paradigms (``ActionHeadType``):
+    1. discrete_token  — OpenVLA, RT-2: action tokens from the backbone
     2. flow_matching   — Pi0, SmolVLA: Euler / RK4 integration
     3. diffusion       — Diffusion Policy: iterative denoising
 
@@ -251,10 +251,10 @@ class ActionHeadRuntime(Protocol):
     """Protocol that every action head implementation must satisfy.
 
     Implementations:
-        - DiscreteTokenHead (discrete_token)
-        - FlowMatchingHead  (flow_matching)
-        - DiffusionHead     (diffusion)
-        - TensorRTBackend   (wraps any of the above with TRT acceleration)
+        - FlowMatchingHead (flow_matching): reference MLP head for tests and
+          the mock sim policy
+        - PrefixKVExpertHead (flow_matching): the π0.5 / SmolVLA action expert
+          over per-layer prefix K/V, in ``benchmarks/sim/lerobot_smolvla.py``
 
     The predict() method is synchronous. The AsyncScheduler manages timing.
     Each robot instance has its own ActionHeadRuntime — state isolation is
@@ -322,7 +322,7 @@ class ActionHeadRuntime(Protocol):
 class WeightSharingHead(Protocol):
     """An action head whose instances can share one copy of the weights.
 
-    Implemented by the built-in heads and TensorRTBackend. Kept separate from
+    Implemented by FlowMatchingHead and PrefixKVExpertHead. Kept separate from
     ActionHeadRuntime so third-party heads without the capability still
     satisfy the core Protocol.
     """
