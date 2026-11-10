@@ -1,7 +1,6 @@
-"""Unit tests for VLM backend implementations.
+"""Unit tests for the VLMBackend contract and its data types.
 
-Tests use mock VLM backends to avoid requiring actual GPU / model weights.
-Kernel tests (kernels/) are intentionally excluded here — they require real GPU.
+Tests use a mock VLM backend to avoid requiring actual GPU / model weights.
 
 Coverage:
 - VLMBackend Protocol compliance

@@ -12,6 +12,8 @@ Running these synchronously means the robot stands still during every backbone f
 | Action generation | 5–20 Hz | `ActionHeadRuntime.predict()` — embedding and state to an action chunk | Close to the robot |
 | Control | 20–100 Hz | Pop the next action from the buffer and send it | On the robot |
 
+The first two rates differ only for a **decoupled** policy, one whose head reads fresh input of its own (state in the action expert) and may re-run on a cached condition. Most deployed VLAs are one network whose backbone and head run back to back on every inference; π0.5 and SmolVLA, the two models integrated so far, are both **coupled** (state in the backbone prefix), so for them perception and action generation run once per request at the same rate. Asynchrony still pays for coupled policies: inference overlaps execution, so the robot does not stand still.
+
 The load-bearing invariant is that inference latency stays below action execution time. As long as the action head produces a chunk covering more wall-clock time than the pipeline takes to produce it, the control loop always has actions queued and never stalls. When that inequality is violated, the runtime degrades along an explicit path rather than blocking.
 
 ## Data flow
@@ -36,7 +38,7 @@ ActionChunk                       actions [chunk_size, action_dim]
      |
      |  integrated under a blend policy
      v
-ChunkBuffer                       latency trim + cross-fade with the queued tail
+ChunkBuffer                       latency trim (default) or a blend with the queued tail
      |
      |  Stage C — control
      v
@@ -45,7 +47,7 @@ next_action()                     one action [action_dim] per control tick
 
 Two boundaries in this chain matter more than the rest.
 
-**The embedding boundary** is what keeps the backbone and the action head independent. They exchange nothing but an `Embedding`, so they can be quantized differently, compiled with different toolchains, and in principle run on different machines. What crosses it depends on the model: a pooled vector, the prefix token sequence, per-layer prefix K/V, or named projected features. That size decides whether the boundary is a viable edge-cloud split point — per-layer K/V for a π0-scale model is on the order of 15 MB per frame.
+**The embedding boundary** is what keeps the backbone and the action head independent. They exchange nothing but an `Embedding`, so they can be scheduled, compiled and given different precision separately. That is what the fleet uses: the backbone runs per robot while heads are batched across robots, and the head's denoising loop is where CUDA Graph replay and RTC guidance plug in. What crosses the boundary depends on the model: a pooled vector, the prefix token sequence, per-layer prefix K/V, or named projected features. Its size rules the boundary out as a network split point for prefix-KV models: per-layer K/V is about 17.8 MB per frame for π0.5. Backbone and head therefore run in the same process on the GPU server; the network carries observations up and action chunks down.
 
 Where robot state enters is also a property of the model, fixed by training. Most policies read it in the action head as a separate tensor; some (SmolVLA, π0.5) read it inside the backbone prefix, and for those the scheduler passes it to `encode()`. Each policy declares this in its `PolicyCapabilities`, and the declaration also decides whether the head may usefully re-run between backbone refreshes. See [Scheduler](./scheduler.md).
 
@@ -59,7 +61,7 @@ Within a single request the two stages are sequential — there is nothing to pr
 
 The chunk buffer is the one component touched from outside the loop. It is designed for exactly one reader — the control loop, which may be a separate thread or process — and one writer, the action head. Its internals are lock-synchronized, and the expensive part of integrating a new chunk is computed outside the lock so a control tick is never blocked behind a blend. See `vla_runtime/scheduler/chunk_buffer.py`.
 
-The action head interface is deliberately synchronous. Frequency guarantees are the scheduler's job, not the head's; a head implementation is a pure function from conditioning inputs to an action chunk, which keeps the three paradigms in `vla_runtime/action_head/` free of scheduling logic.
+The action head interface is deliberately synchronous. Frequency guarantees are the scheduler's job, not the head's; a head implementation is a pure function from conditioning inputs to an action chunk, which keeps heads free of scheduling logic.
 
 ## Degradation paths
 

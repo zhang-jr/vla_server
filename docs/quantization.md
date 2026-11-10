@@ -1,8 +1,10 @@
 # Quantization
 
-A VLA policy does not compress uniformly. The vision-language backbone tolerates aggressive quantization the way any large transformer does. An iterative action head does not, and the reason is structural rather than incidental. The runtime therefore treats precision as a per-module policy, enforces the constraint in the type system, and validates the result against task success rather than loss.
+A VLA policy does not compress uniformly. The vision-language backbone tolerates aggressive quantization the way any large transformer does. An iterative action head does not, and the reason is structural rather than incidental. The runtime therefore treats precision as a per-module policy, enforces the constraint in the type system, and accepts a precision change only on closed-loop task success, not on loss.
 
 Source: `vla_runtime/quantization/`
+
+`QuantizationConfig` records and checks the policy; it does not quantize anything. A precision change to a real model is an option of its adapter, accepted by the closed-loop benchmark (see "Accepting a precision change" below). No quantized backbone has been validated in closed loop yet.
 
 ## Why the action head is different
 
@@ -39,36 +41,11 @@ QuantizationConfig.cloud_aggressive()   # w8a8 vision, w4a16 backbone, fp16 head
 QuantizationConfig.edge_balanced()      # w8a8 vision, gguf_q4 backbone, fp16 head
 ```
 
-`edge_balanced()` pairs with `LlamaCppBackend` for embedded deployment — see [VLM backends](./vlm-backends.md).
+## Accepting a precision change
 
-## Calibration
+The precision changes made so far went through the closed-loop sim benchmark. An example: LeRobot keeps π0.5's SigLIP vision tower and projector in fp32. Running them in bf16 (`--policy-opt vision_bf16=1`) cut the prefix pass from 67 to 51 ms with a maximum action deviation of 6e-3, and the change was accepted by comparing 1–6 robot fleets × 100 episodes, paired by seed, against the fp32 run with McNemar tests (no setting significantly worse).
 
-Source: `vla_runtime/quantization/calibration.py`
-
-`VLACalibrationPipeline` calibrates the three modules independently, each with its own calibrator, and returns a `CalibrationResult` carrying the quantized modules plus per-module timing and sample counts.
-
-```python
-pipeline = VLACalibrationPipeline(CalibrationConfig(num_samples=512, seed=42))
-result = pipeline.calibrate(model, quant_config, samples, head_type="flow_matching")
-print(result.summary())
-```
-
-`CalibrationConfig` controls scope and reproducibility:
-
-| Field | Default | Purpose |
-|---|---|---|
-| `num_samples` | 512 | Calibration samples consumed |
-| `batch_size` | 8 | Forward-pass batch size |
-| `seed` | 42 | Fixed seed for shuffling |
-| `max_seq_len` | 1024 | Token length cap during calibration |
-| `device` | `"cuda"` | Where calibration runs |
-| `verbose` | `False` | Emit per-layer quantization error statistics |
-
-Reproducibility is a hard requirement rather than a convenience. Calibration is stochastic in its sample selection, and a quantized checkpoint that cannot be regenerated is one that cannot be debugged when its success rate drops — so the seed, the sample set, and the task suite are all pinned.
-
-Calibration samples are `CalibrationSample` records holding an image, an instruction, and optionally a robot state. The state is needed only for action head calibration, since that is the only module conditioned on it.
-
-Precision constraints are checked at the entry point, before any compute is spent: calibrating a flow matching head at anything other than float16 fails immediately rather than after several hundred forward passes.
+The method generalizes: same checkpoint, same suite, same seeds, the changed and unchanged configurations run as paired episodes, and the decision is made on the paired success difference, not on the action error. See [Benchmark methodology](./benchmark_methodology.md).
 
 ## Validation
 
@@ -104,7 +81,7 @@ The two modes exist because a full suite is too slow to gate every change. `smok
 
 ### Testing without a simulator
 
-`MockSimEnvironment` and `MockPolicy` implement the `SimEnvironment` and `PolicyCallable` interfaces with deterministic synthetic outcomes, so the validation logic — thresholds, aggregation, error paths — can be exercised in unit tests without installing a simulator. `validate_quantization_config()` is a one-shot helper wrapping the whole flow for quick checks.
+`MockSimEnvironment` and `MockPolicy` implement the `SimEnvironment` and `PolicyCallable` interfaces with deterministic synthetic outcomes, so the validation logic — thresholds, aggregation, error paths — can be exercised in unit tests without installing a simulator. `validate_quantization_config()` is a one-shot helper wrapping baseline and comparison for quick checks.
 
 To integrate a real simulator, implement `SimEnvironment`:
 
@@ -118,12 +95,8 @@ class SimEnvironment(abc.ABC):
 
 The explicit `seed` on `reset()` is what makes an episode replayable — a failing episode can be reproduced exactly rather than sampled for again.
 
-## Compiled engines
-
-`TensorRTBackend` carries the same precision constraint at compile time: it refuses to build an int8 engine for a flow matching or diffusion head, raising `PrecisionDegradationError` in the constructor. An aggressive engine configuration fails at build rather than producing a policy that runs fast and misses. See [Action heads](./action-heads.md).
-
 ## Related documents
 
 - [Action heads](./action-heads.md) — why the three paradigms differ in precision tolerance
-- [VLM backends](./vlm-backends.md) — engine-level quantization options per adapter
+- [Benchmark methodology](./benchmark_methodology.md) — the closed-loop comparisons that accept a change
 - [Observability](./observability.md) — `PrecisionDegradationError` and its trace context

@@ -1,302 +1,156 @@
 # VLA Runtime
 
-**A model-agnostic serving runtime for Vision-Language-Action models** — serve any VLA model the way vLLM serves LLMs.
+**A multi-robot policy server for action-chunking VLA models** — one GPU serves several robots, each within its own latency budget.
 
 ---
 
-## Background
+## Scope
 
-VLA deployment today looks a lot like LLM serving in 2022, before vLLM:
+The target is a GPU server on the same site as the robots (a lab, a production line, a data-collection or evaluation farm) serving fixed-base arms over the local network.
 
-- There is no unified inference framework; each team builds its own modular async pipeline, and they all look alike
-- Optimizations are scattered across research papers with no production-grade integration
-- The core optimizations of vLLM/SGLang (KV cache, continuous batching, PagedAttention) mostly fail or yield marginal gains in VLA workloads
+Out of scope:
+- closed-loop control from a public cloud region, because its round-trip latency and jitter do not fit a chunk's budget;
+- on-robot inference for a single humanoid, which has its own stacks (TensorRT pipelines on Jetson Thor).
 
-This project fills the "vLLM for VLA" gap with a production-deployable VLA serving runtime.
+Official policy servers (openpi, LeRobot) already serve one model to one robot well. This project adds what their structure does not have:
 
----
+- **Deadline-aware fleet serving.** One loaded model serves N robots. Backbone passes run per robot. Action heads that share weights are batched across robots in one pass: the head is launch-bound, so a batch of four costs little more than one. Optional admission control predicts the round latency for the registered robots.
+- **Chunk execution under latency.** Latency trimming, blend policies and Real-Time Chunking (RTC) guidance for flow-matching experts. The closed-loop benchmark measures how much latency a policy tolerates.
+- **Capability declarations.** `PolicyCapabilities` declares, per model, where robot state enters, what crosses the backbone → head boundary and whether the head is iterative. The schedulers act on the declaration instead of assuming.
+- **Closed-loop benchmarks.** Task success, latency percentiles, buffer underruns and smoothness are measured together, in simulation (LIBERO / ManiSkill) and on a real arm (ARX X5).
 
-## Core Design
+## Results so far
 
-### Three-Stage Async Pipeline
+π0.5 (`pi05_libero_finetuned_v044`) × LIBERO-10 on one RTX 4090 D, in simulation. Comparisons are paired by seed, 100–500 episodes per cell; network round trip not included.
+
+| Question | Result |
+|---|---|
+| How much latency does closed loop tolerate? | 0 ms (sync): 90.2%. Trim blending: 92.4% at 300 ms. RTC with the `zeros` prefix schedule: 94.4% at 300 ms and 89.0% at 500 ms (no significant drop from 0 ms). Every configuration drops significantly from 750 ms. |
+| Cross-fading chunks? | `linear_overlap` is 15–19 pp below plain trimming at 150–500 ms, so trimming is the default. |
+| RTC prefix schedule? | Guiding only the frozen delay steps (`zeros`) beats the paper's exponential schedule by +7.8 / +12.2 pp at 300 / 500 ms. |
+| Robots per GPU at P95 ≤ 300 ms | Serial dispatch: 1. Head batching + CUDA Graph + bf16 vision tower + sdpa: 3 robots, P95 229 ms, 95% success (same as 1 robot). |
+| Load-adaptive replan threshold? | Not the default: at best about 2 pp over a fixed threshold, and only at light load. |
+
+Model-level latency on the same GPU (P50, raw frames → actions on host, single robot):
+- OpenVLA-7B: 162 ms
+- OpenVLA-OFT: 113 ms
+- π0.5 (bf16): 161 ms
+- SmolVLA: 110 ms
+
+ARX X5 real-arm closed loop with π0.5: end-to-end P50 is 237 ms, of which about 65 ms is outside inference (camera frame age, transport, command).
+
+These numbers hold for this checkpoint, suite, GPU and acceleration stack. They are not a claim of beating the official servers on single-robot latency.
+
+## Status
+
+Research prototype.
+
+| Model | Integration | State |
+|---|---|---|
+| π0.5 (LeRobot) | Split at the prefix-KV boundary, `benchmarks/sim/lerobot_pi05.py` | Matches native inference (1e-3); closed-loop LIBERO; fleet batching; CUDA Graph expert |
+| SmolVLA (LeRobot) | Split at the prefix-KV boundary, `benchmarks/sim/lerobot_smolvla.py` | Matches native inference; closed-loop LIBERO; fleet batching |
+| OpenVLA, OpenVLA-OFT, π0 | Model-level latency benchmark only (`benchmarks/latency`) | Not integrated into the runtime |
+
+Not built yet:
+- a network endpoint in front of the fleet (an OpenPI-compatible WebSocket is planned);
+- a client-side chunk executor for real robots;
+- serving several models on one GPU.
+
+The model adapters and CUDA Graph capture currently live under `benchmarks/sim/` and will move into the package.
+
+## Design
 
 ```
-Thread A — perception     1–5 Hz    heavy compute, can run in the cloud
-Thread B — action gen     5–20 Hz   medium frequency
-Thread C — control loop   20–100 Hz real-time, must run on the edge
+Application      ActionRequest (camera views + instruction + robot state)
+Serving          FleetScheduler: N robots over one loaded model, head batching, admission
+Pipeline         AsyncScheduler: one robot, encode → head → ChunkBuffer
+Module           VLMBackend | ActionHeadRuntime (+ PolicyCapabilities, Policy)
+Infra            RTC guidance | Observability | Precision policy
 ```
 
-The three stages differ enormously in frequency and compute density. **Async decoupling is the core architecture, not an optimization.** Synchronous inference leaves the robot idle and violates the hard constraint `inference_latency < action_execution_time`.
+A policy is split at the boundary between its vision-language prefix and its action expert. The split is not for running the two at different rates or on different machines: the per-layer prefix K/V that crosses it is about 17.8 MB per frame for π0.5, so both halves run in the same process on the GPU server. The split exists so that the two halves can be scheduled differently:
+- the compute-bound backbone runs per robot;
+- the launch-bound head is batched across robots;
+- the head's denoising loop is where CUDA Graph replay and RTC guidance plug in.
 
-### Layered Architecture
+Robot state goes where the model was trained to read it. For π0.5 and SmolVLA that is the backbone prefix, which makes them **coupled**: backbone and head run once per request. A **decoupled** policy, whose head reads fresh state, may re-run its head on a cached condition. The policy declares which kind it is in `PolicyCapabilities`.
 
-```
-Application      ← ActionRequest (image + instruction + robot_state)
-Serving          ← API Server / Fleet Scheduler / Edge-Cloud Router
-Pipeline         ← AsyncScheduler (perception → action → control)
-Module           ← VLM Backend  |  Action Head Runtime  |  ROS2 Control
-Infra            ← Triton/CUDA Kernel | Quantization | Observability
-```
+See [`docs/`](./docs/README.md) for the subsystems.
 
-### Concept Mapping to vLLM
-
-| vLLM | VLA Runtime | Notes |
-|------|-------------|-------|
-| LLM | `VLMBackbone` | Vision-language backbone, low-frequency heavy compute |
-| Token Generation | `ActionHead` | Discrete token / flow matching / diffusion |
-| KV Cache | `EmbeddingCache` | Reuse perception embeddings across frames |
-| Continuous Batching | `FleetServing` | One shared VLM instance (weights); per-robot forward passes and strictly isolated state |
-| API Server | `ActionEndpoint` | REST + WebSocket, `POST /v1/action` |
-| Scheduler | `AsyncScheduler` | Three-stage pipeline (perception / action / control) |
-
----
-
-## Project Layout
-
-```
-vla_runtime/
-├── vlm/                # VLM backbone backends (vLLM / SGLang / llama.cpp / LMDeploy)
-├── action_head/        # Action head runtimes (discrete_token / flow_matching / diffusion)
-├── scheduler/          # Async pipeline (AsyncScheduler / ChunkBuffer / BudgetManager)
-├── control/            # ROS2 integration (Python bridge + C++ control node)
-├── serving/            # API server + fleet scheduling + edge-cloud router
-├── quantization/       # Quantization config + calibration + sim validation
-├── observability/      # Structured tracer + metrics
-└── errors.py           # Exception hierarchy
-kernels/                # Triton / CUDA kernels (flow matching / diffusion / fused attention)
-tests/unit/             # Unit tests
-examples/               # End-to-end examples
-docs/                   # Subsystem documentation
-```
-
-See [`docs/`](./docs/README.md) for in-depth documentation of each subsystem.
-
----
-
-## Quick Start
-
-### Install
+## Quick start
 
 ```bash
 pip install -e ".[dev]"
+python examples/minimal_pipeline.py    # mock backbone + reference head, CPU only
+python -m pytest                       # CPU unit tests
 ```
 
-### Minimal Example (no GPU)
+Closed-loop benchmarks need a CUDA host. In this repository, GPU work runs on a remote host through `scripts/remote.py`:
 
 ```bash
-python examples/openvla_minimal.py
+# CPU plumbing check, any machine
+python -m benchmarks.sim.run --env mock --policy mock --modes all --episodes 2
+
+# π0.5 fleet on LIBERO-10, 1–4 robots sharing one GPU
+python scripts/remote.py run -- python -m benchmarks.sim.run \
+    --env libero --env-opt suite=libero_10 --policy pi05 \
+    --policy-opt cuda_graph=1 --policy-opt vision_bf16=1 --policy-opt expert_sdpa=2 \
+    --modes realtime --robots 1,2,3,4 --chunk-threshold 0.9
 ```
 
-The example uses a mock VLM backend and runs the full pipeline without a GPU: quantization config → VLM encode → action head decode → chunk buffer consumption.
+See [`docs/benchmark_methodology.md`](./docs/benchmark_methodology.md) for the execution modes, metrics and options.
 
-### Real models and GPU work
-
-No real model runs end to end yet: the vLLM / SGLang / LMDeploy / llama.cpp adapters are stubs that return correctly shaped placeholder tensors.
-
-Tests that need a GPU are marked `@pytest.mark.gpu` and are skipped automatically where no CUDA device is visible. Run them on a CUDA machine with:
-
-```bash
-python -m pytest -m gpu
-```
-
----
-
-## Core Interfaces
-
-### VLMBackend
+## Core interfaces
 
 ```python
 class VLMBackend(Protocol):
-    async def encode(
-        self, images: Mapping[str, Tensor], text: str, state: RobotState | None = None,
-    ) -> Embedding: ...
-    async def generate(
-        self, images: Mapping[str, Tensor], text: str, state: RobotState | None = None,
-    ) -> AsyncIterator[TokenChunk]: ...
-    @property
-    def latency_budget_ms(self) -> float: ...
-```
+    async def encode(self, images: Mapping[str, Tensor], text: str,
+                     state: RobotState | None = None) -> Embedding: ...
 
-Supported backends: `vLLM`, `SGLang`, `LMDeploy` (cloud); `llama.cpp + GGUF` (edge). The adapters are currently stubs that return correctly shaped placeholder tensors; no real model is wired end to end yet.
-
-`Embedding` is a typed condition — `pooled`, `prefix_tokens`, `per_layer_kv`, or `projected_features` — because what a real action head reads is often per-layer prefix K/V or projected features rather than one vector. `state` reaches the backbone only for policies trained with state in the prefix.
-
-### ActionHeadRuntime
-
-```python
 class ActionHeadRuntime(Protocol):
     def predict(self, embedding: Embedding, robot_state: RobotState) -> ActionChunk: ...
-    @property
-    def head_type(self) -> Literal["discrete_token", "flow_matching", "diffusion"]: ...
-    @property
-    def frequency_hz(self) -> float: ...
+    # Optional capabilities: WeightSharingHead (spawn), RealTimeChunkingHead (context),
+    # BatchedActionHead (predict_batch)
+
+class PolicyCapabilities(BaseModel):
+    state_placement: Literal["prefix", "suffix", "head_encoder", "none"]
+    condition_kind: Literal["pooled", "prefix_tokens", "per_layer_kv", "projected_features"]
+    head_structure: Literal["iterative", "single_pass", "monolithic"]
+    max_condition_staleness_ms: float | None
+    supports_rtc: bool
+
+fleet = FleetScheduler.from_policy(policy, FleetConfig(max_robots=4))
+await fleet.start()
+await fleet.register_robot("arm_0")
+handle = await fleet.submit("arm_0", request)
+async for chunk in fleet.stream(handle):
+    ...
 ```
 
-Three paradigms are supported: discrete tokens (OpenVLA / RT-2), flow matching (Pi0 / SmolVLA), and diffusion (Diffusion Policy).
+`Embedding` is a typed condition: `pooled`, `prefix_tokens`, `per_layer_kv` or `projected_features`. Its payload is checked against its kind at construction, and its `nbytes` is reported in traces.
 
-### AsyncScheduler
+## Precision policy
 
-```python
-scheduler = AsyncScheduler(
-    vlm_backend=...,
-    action_head=...,
-    capabilities=PolicyCapabilities(       # declared per model, not guessed (ADR-018)
-        state_placement="suffix",
-        condition_kind="per_layer_kv",
-        head_structure="iterative",
-        max_condition_staleness_ms=300.0,
-    ),
-    budget_config=...,
-)
-await scheduler.start()
+| Component | Allowed | Reason |
+|---|---|---|
+| Vision encoder / backbone | fp16 or lower, model by model | Runs once per frame; small perturbations are absorbed |
+| Iterative action head | 16-bit float (fp16 / bf16); no INT4 | Each denoising step feeds the next, so error compounds |
+| Discrete-token head | additionally W8A16 | One decision per token; error does not compound |
 
-handle = await scheduler.submit(request)
-async for chunk in scheduler.stream(handle):
-    robot.execute(chunk)
-```
+A precision change is accepted only on closed-loop task success, paired against the unchanged model. Loss and action error alone are not enough.
 
-The policy's capabilities decide its frequency mode. A **decoupled** policy (head consumes fresh state, iterative, staleness calibrated) may re-run its head on the cached condition via `replan()`, and on a backbone timeout reuses the last condition within its tolerance. A **coupled** policy (e.g. state in the backbone prefix) never re-runs the head on an old condition; on a timeout the robot keeps executing the queued chunk tail.
+## References
 
-Three built-in degradation hooks: `on_vlm_timeout` (decoupled only — reuse the previous condition within tolerance), `on_action_head_failure`, and `on_budget_exceeded`.
-
-### QuantizationConfig
-
-```python
-# Aggressive cloud preset
-cfg = QuantizationConfig.cloud_aggressive()
-# vision_encoder=w8a8, llm_backbone=w4a16, action_head=fp16
-
-# flow matching / diffusion require action_head=fp16; violations raise PrecisionDegradationError
-cfg.validate_for_head_type("flow_matching")
-```
-
----
-
-## Quantization Policy
-
-| Component | Allowed | Forbidden | Reason |
-|-----------|---------|-----------|--------|
-| Vision Encoder | fp16 / w8a8 / w4a8 | - | - |
-| LLM Backbone | fp16 / w4a16 / w8a16 / gptq / gguf_q4 | - | - |
-| Action Head | **fp16 / w8a16 only** | INT4 / GPTQ | Iterative denoising accumulates error; INT4 collapses task success rate |
-
-Acceptance criterion: end-to-end sim task success rate drops by ≤ 2 pp after quantization — loss alone is not enough.
-
----
-
-## Observability
-
-Every inference emits a structured trace:
-
-```json
-{
-  "trace_id": "abc123",
-  "request_id": "req-001",
-  "module": "async_scheduler",
-  "event": "perception_complete",
-  "duration_ms": 48.3,
-  "frame_id": 42,
-  "stale_frames": 0,
-  "quantization": "w4a16"
-}
-```
-
-The JSON tracer will be replaced by OpenTelemetry, exporting to Langfuse / Jaeger.
-
----
-
-## Performance Targets
-
-| Metric | Mid-term Target | Final Target |
-|--------|-----------------|--------------|
-| End-to-end latency P50 | ≤ 500 ms | Baseline −10% |
-| End-to-end latency P95 | ≤ 600 ms | ≤ 550 ms |
-| Throughput | ≥ 3 FPS | ≥ 5 FPS |
-| GPU memory | ≤ 90% of baseline | ≤ 80% of baseline |
-| Success-rate drop after quantization | ≤ 2 pp | ≤ 1 pp |
-
-Reference baseline: LiteVLA-Edge at 150.5 ms (llama.cpp + GGUF Q4 + ROS2, edge deployment).
-
----
-
-## Supported VLA Models (Planned)
-
-| Model | Head Type | VLM Backend | Status |
-|-------|-----------|-------------|--------|
-| OpenVLA-7B | discrete_token | vLLM / SGLang | Adapter done, pending real-GPU validation |
-| SpatialVLA-4B | discrete_token | vLLM | Adapter done |
-| SmolVLA / Pi0 | flow_matching | llama.cpp | Adapter done |
-| Diffusion Policy | diffusion | - | Head done |
-
----
-
-## Tech Stack
-
-| Component | Choice |
-|-----------|--------|
-| Cloud VLM | vLLM / SGLang / LMDeploy |
-| Edge VLM | llama.cpp + GGUF |
-| Action Head Kernel | Triton (primary) + TensorRT (fallback) |
-| Serialization | msgpack (2–5x faster than JSON) |
-| Transport | WebSocket (default) / gRPC (enterprise) |
-| Control Integration | ROS2 Humble+, C++ control node |
-| Quantization Calibration | LLM-Compressor / TensorRT calibrator |
-| Sim Validation | LIBERO / RoboCasa |
-| Tracing | OpenTelemetry → Langfuse / Jaeger |
-| Testing | pytest + pytest-benchmark |
-
----
-
-## TODO
-
-**Baselines & Validation**
-- [ ] GPU server (A100 / H100) and edge device (Jetson Orin) environments
-- [ ] Containerized sim environments (LIBERO + RoboCasa)
-- [ ] Native inference baselines for OpenVLA / SpatialVLA
-- [ ] Reproduce LiteVLA-Edge (target ≈ 150.5 ms)
-- [ ] Unoptimized end-to-end sim task success rate
-- [ ] Sim success rate for every quantization combination
-
-**Performance**
-- [ ] Triton kernel profiling (Nsight Compute)
-- [ ] Triton vs TensorRT vs ONNX Runtime comparison
-- [ ] Resident action head weights + on-demand VLM loading
-- [ ] Hit the latency / throughput / memory targets on real GPUs
-
-**System Integration**
-- [ ] ROS2 integration: Python bridge + C++ control node, rosbag record & replay
-- [ ] Edge-cloud split scheduling over WebSocket + msgpack, with offline fallback
-- [ ] Real-robot robustness: safe takeover ramp, observation freshness, `ObservationStaleError`
-- [ ] API server: `POST /v1/action`, WebSocket streaming, OpenPI wire-schema compatibility
-- [ ] Model hot-swap, Prometheus metrics, health checks
-- [ ] OpenTelemetry tracer
-
-**Model & Embodiment Generalization**
-- [ ] Real-Time Chunking (RTC) support for flow matching heads
-- [ ] Single-arm, bimanual, and mobile manipulation embodiments
-- [ ] Action space abstraction (joint / cartesian / delta) with structured actuator groups
-- [ ] Fleet serving with ≥ 5 independent robots
-
-**Release**
-- [ ] PyPI package
-- [ ] Docker images (server + edge)
-- [ ] HuggingFace Hub integration
-- [ ] Public benchmark suite
-
----
-
-## Key References
-
-| Reference | Key Contribution |
-|-----------|------------------|
-| [LiteVLA-Edge: Quantized On-Device Multimodal Control for Embedded Robotics](https://arxiv.org/abs/2603.03380) | Full edge deployment with llama.cpp + ROS2, 150.5 ms baseline |
-| [How Fast Can I Run My VLA? Demystifying VLA Inference Performance with VLA-Perf](https://arxiv.org/abs/2602.18397) | Systematic analysis of VLA inference performance, 15 key takeaways |
-| [RoboECC: Multi-Factor-Aware Edge-Cloud Collaborative Deployment for VLA Models](https://arxiv.org/abs/2603.20711) | Automatic edge-cloud split point selection, up to 3.28x speedup |
-| [Fine-Tuning Vision-Language-Action Models: Optimizing Speed and Success (OpenVLA-OFT)](https://arxiv.org/abs/2502.19645) | Parallel decoding with bidirectional attention, 26x action throughput |
-| [DeeR-VLA: Dynamic Inference of Multimodal Large Language Models for Efficient Robot Execution](https://arxiv.org/abs/2411.02359) | Dynamic early-exit mechanism (NeurIPS 2024) |
-| [LeRobot](https://github.com/huggingface/lerobot) | PolicyServer + RobotClient async inference, the closest existing framework |
-
----
+| Reference | Relevance |
+|---|---|
+| [Real-Time Execution of Action Chunking Flow Policies](https://arxiv.org/abs/2506.07339) | RTC guidance implemented here |
+| [Training-Time Action Conditioning for Efficient Real-Time Chunking](https://arxiv.org/abs/2512.05964) | RTC moved into training; same context interface |
+| [LeRobot](https://github.com/huggingface/lerobot) | PolicyServer + RobotClient async inference; source of the π0.5 / SmolVLA checkpoints |
+| [openpi](https://github.com/Physical-Intelligence/openpi) | Official π0 / π0.5 remote-inference server and wire protocol |
+| [How Fast Can I Run My VLA? (VLA-Perf)](https://arxiv.org/abs/2602.18397) | VLA inference performance analysis |
+| [KerColle](https://arxiv.org/abs/2609.22335) | GPU concurrency between VLA backbone and action stages |
+| [vla.cpp](https://arxiv.org/abs/2606.08094) | Unified C++ inference engine for 11 VLA models |
+| [OpenVLA-OFT](https://arxiv.org/abs/2502.19645) | Parallel decoding for OpenVLA |
 
 ## License
 

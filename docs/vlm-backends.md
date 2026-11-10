@@ -1,8 +1,8 @@
 # VLM Backends
 
-The vision-language backbone is the expensive half of a VLA policy and the half with the most mature serving ecosystem behind it. Rather than reimplementing inference, the runtime defines a narrow protocol and adapts existing engines to it. Everything downstream depends only on the protocol, so backends are interchangeable.
+The vision-language backbone is the half of a VLA policy that reads the camera views and the instruction. The runtime defines a narrow protocol for it; everything downstream depends only on the protocol, so backbones are interchangeable.
 
-Source: `vla_runtime/vlm/`
+Source: `vla_runtime/vlm/base.py` (protocol and data types); `benchmarks/sim/lerobot_smolvla.py` (the prefix-KV backbone).
 
 ## The protocol
 
@@ -27,7 +27,7 @@ class VLMBackend(Protocol):
     async def shutdown(self) -> None: ...
 ```
 
-Every method is async and must not block the event loop — backends wrapping synchronous libraries are expected to dispatch through a thread pool internally, which is what the llama.cpp adapter does.
+Every method is async and must not block the event loop. A backbone wrapping synchronous GPU work dispatches it to a thread internally; the prefix-KV backbone uses one dedicated thread, which also serializes concurrent fleet requests on the shared weights.
 
 `encode()` is the path used by flow matching and diffusion heads: it returns the condition the action head reads. `generate()` is the token-level path used only by discrete-action-token models, returning an async iterator the caller must drain. A backend serving a flow matching policy does not need a meaningful `generate()`.
 
@@ -43,7 +43,7 @@ The single object crossing the boundary between the backbone and the action head
 
 | `kind` | Payload | Example models |
 |---|---|---|
-| `pooled` | `data` `[hidden_dim]` | Simple MLP heads (the built-in heads) |
+| `pooled` | `data` `[hidden_dim]` | Simple MLP heads (the reference `FlowMatchingHead`) |
 | `prefix_tokens` | `data` `[seq_len, hidden_dim]` | Heads that cross-attend over the prefix sequence |
 | `per_layer_kv` | `layer_kv`: one `LayerKV(key, value)` per layer, each `[num_kv_heads, seq_len, head_dim]` | π0-style joint attention, where the action expert attends over every layer's prefix K/V |
 | `projected_features` | `features`: named tensors | GR00T-style heads that read projected backbone features |
@@ -81,38 +81,17 @@ Robot state travels as a tensor on its own channel and is handed to the action h
 
 ### `TokenChunk` and `TokenStream`
 
-`TokenStream` is an `AsyncIterator[TokenChunk]`. Each chunk carries `token_ids`, optional `log_probs`, and an `is_final` flag. Only discrete-token models use this path — see `DiscreteTokenHead.predict_from_stream()` in [Action heads](./action-heads.md).
+`TokenStream` is an `AsyncIterator[TokenChunk]`. Each chunk carries `token_ids`, optional `log_probs`, and an `is_final` flag. Only discrete-token models (autoregressive action tokens) use this path; none is integrated yet.
 
-## Adapters
+## The prefix-KV backbone
 
-Four adapters ship with the runtime, covering server-class and embedded deployment.
+Source: `benchmarks/sim/lerobot_smolvla.py` (`PrefixKVBackbone`), with model classes for SmolVLA (same file) and π0.5 (`benchmarks/sim/lerobot_pi05.py`)
 
-| Adapter | Engine | Intended for | Key constructor arguments |
-|---|---|---|---|
-| `VLLMBackend` | vLLM `AsyncLLMEngine` | Cloud and datacenter GPUs | `model_path`, `tensor_parallel_size`, `quantization`, `kv_cache_enabled` |
-| `SGLangBackend` | SGLang Runtime | Cloud, structured decoding workloads | `model_path`, `tp_size`, `quantization` |
-| `LMDeployBackend` | LMDeploy TurboMind | Cloud, quantized serving | `model_path`, `tp`, `cache_max_entry_count`, `quant_policy` |
-| `LlamaCppBackend` | llama-cpp-python, GGUF | Edge and embedded devices | `model_path`, `n_gpu_layers`, `n_ctx`, `n_threads`, `embedding_dim` |
+π0.5 and SmolVLA are each one network: a VLM runs over the prefix (camera views, instruction, and for these two models the robot state), and a flow-matching action expert attends over every layer's prefix K/V while it denoises. `PrefixKVBackbone.encode()` runs the LeRobot model's own prefix pass in-process and returns those K/V as a `per_layer_kv` condition. The matching head is `PrefixKVExpertHead` ([Action heads](./action-heads.md)). Together they reproduce the model's native `sample_actions` step for step; the GPU tests check the split against LeRobot's own inference with shared noise (max deviation 1e-3).
 
-All four take `latency_budget_ms` and forward unrecognized keyword arguments to the underlying engine, so engine-specific tuning stays available without the adapter having to enumerate every option.
+The condition is large: about 17.8 MB per frame for π0.5 (18 layers × 968 prefix tokens). It never leaves the GPU; backbone and head run in the same process, and what crosses the network is the observation going up and the action chunk coming down.
 
-The edge adapter differs in more than which library it calls. `n_ctx` defaults to 512 because VLA context genuinely is short, and it wraps its synchronous llama.cpp calls in a thread pool so the async contract holds. Its default `latency_budget_ms` is higher than the server adapters', reflecting that an edge device is slower but still has to stay inside the control loop's tolerance.
-
-## KV cache management
-
-Source: `vla_runtime/vlm/kv_cache.py`
-
-Cross-frame reuse is worth having in VLA serving, but the mechanism differs from LLM serving. A VLA context is an image plus a short instruction — typically well under a thousand tokens — so there is no fragmentation problem to solve and no reason to page. What there is instead is a clear structural split: the image tokens are the expensive, reusable part, and the text tokens are what accumulate.
-
-`KVCacheManager` exploits that split directly.
-
-- The pool is pre-allocated at construction, so allocation and release during serving are O(1) free-list operations with no allocator pressure in the hot path.
-- Image tokens are pinned. They are never evicted, because they are the part worth keeping.
-- Text tokens evict under a sliding window, oldest first, shifting the retained tail in place across every layer.
-
-`KVCacheConfig` describes the backbone's shape — `num_layers`, `num_heads`, `head_dim` — plus `max_context_tokens`, `num_image_tokens`, and `pool_size`, which should be at least the number of concurrent robots. `bytes_per_slot` and `pool_memory_gb` are computed from those, so the memory footprint is known before anything is allocated rather than discovered when it runs out.
-
-The API is `allocate()`, `write_kv()`, `evict_oldest_text_tokens()`, `free()`, and `get()`, with `stats()` and `memory_usage_gb()` for introspection. Setting `eviction_policy="none"` turns overflow into an error instead of silently dropping context, which is the right behavior while establishing how much context a given model actually needs.
+General-purpose LLM engines (vLLM, SGLang, LMDeploy, llama.cpp) are not used for this backbone. Their public interfaces do not hand per-layer K/V to an external consumer, and they do not run the expert's joint attention over the prefix, so integrating one would mean writing the expert into the engine's model code. They fit models whose output is text or action tokens, such as a high-level planner that issues language subtasks.
 
 ## Implementing a backend
 
@@ -122,7 +101,7 @@ Report an honest `latency_budget_ms`. The scheduler uses it to decide when to fa
 
 Produce the condition kind the policy declares. The scheduler compares every `Embedding.kind` against `PolicyCapabilities.condition_kind` and raises `PolicyCapabilityError` on a mismatch, because the head would otherwise receive a payload it cannot read.
 
-Accept `state` and use it only if the model consumes state in its prefix. The shipped adapters are still stubs and ignore it; a real adapter for a prefix-state model must place it where the model was trained to find it.
+Accept `state` and use it only if the model consumes state in its prefix. A prefix-state model must place it where the model was trained to find it; the prefix-KV backbone hands it to the model's own preprocessing.
 
 Never block the event loop. If the underlying library is synchronous, dispatch through an executor.
 
@@ -132,5 +111,5 @@ Raise the runtime's own exception types. `VLMTimeoutError` and `BackendError` ca
 
 - [Architecture](./architecture.md) — where the backbone sits in the pipeline
 - [Action heads](./action-heads.md) — what consumes the embedding
-- [Quantization](./quantization.md) — how aggressively the backbone can be compressed
+- [Quantization](./quantization.md) — precision policy and how precision changes are accepted
 - [Fleet serving](./fleet-serving.md) — sharing one backbone across many robots

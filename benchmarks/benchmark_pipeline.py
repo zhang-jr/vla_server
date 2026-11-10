@@ -3,11 +3,10 @@
 Measures the full inference latency of:
   1. AsyncScheduler (single robot, mock VLM + action head)
   2. FleetScheduler (multi-robot, shared mock VLM)
-  3. Per-head latency (FlowMatching / Diffusion / DiscreteToken with mock VLM)
 
 These benchmarks use MockVLMBackend so they run on CPU without a real model.
-They validate the scheduler and buffer overhead, not kernel speed.
-Kernel speed is measured separately in benchmark_kernels.py.
+They validate the scheduler and buffer overhead, not model speed; real-model
+latency is measured by ``benchmarks/latency`` and ``benchmarks/sim``.
 
 Phase 2 targets (from TODO.md):
     - End-to-end P50 ≤ 500ms (full VLM, not mock)
@@ -227,63 +226,6 @@ def test_benchmark_fleet_8_robots(benchmark):
 
     elapsed = benchmark(run)
     assert elapsed < 10000.0
-
-
-# ── KV cache benchmarks ───────────────────────────────────────────────────────
-
-def test_benchmark_kv_alloc_free(benchmark):
-    """KV cache allocate+free cycle — must be O(1) amortised."""
-    from vla_runtime.vlm.kv_cache import KVCacheConfig, KVCacheManager
-
-    # Use CPU to avoid GPU memory issues on CI
-    cfg = KVCacheConfig(
-        num_layers=4,
-        num_heads=4,
-        head_dim=32,
-        max_context_tokens=64,
-        pool_size=8,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    manager = KVCacheManager(cfg)
-
-    def run():
-        slot = manager.allocate("req-bench")
-        manager.free("req-bench")
-        return slot
-
-    result = benchmark(run)
-    assert result is not None
-    manager.shutdown()
-
-
-def test_benchmark_kv_write_tokens(benchmark):
-    """KV cache write_kv for 10 new tokens per call."""
-    from vla_runtime.vlm.kv_cache import KVCacheConfig, KVCacheManager
-
-    cfg = KVCacheConfig(
-        num_layers=4,
-        num_heads=4,
-        head_dim=32,
-        max_context_tokens=128,
-        pool_size=4,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    manager = KVCacheManager(cfg)
-    slot = manager.allocate("req-write")
-
-    new_k = torch.zeros(10, 4, 32)
-    new_v = torch.zeros(10, 4, 32)
-
-    def run():
-        slot.seq_len = 0  # reset without full free/alloc cycle
-        for layer in range(4):
-            slot.write_kv(layer, new_k, new_v)
-
-    benchmark(run)
-    manager.free("req-write")
-    manager.shutdown()
 
 
 # ── Throughput summary ────────────────────────────────────────────────────────

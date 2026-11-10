@@ -4,7 +4,7 @@ Two kinds of benchmark live in `benchmarks/`:
 
 | Suite | What it measures | Where it runs |
 |---|---|---|
-| `benchmark_pipeline.py`, `benchmark_kernels.py` | Scheduler overhead with mock models; Triton kernels vs PyTorch | pytest-benchmark; kernels need a GPU |
+| `benchmark_pipeline.py` | Scheduler and fleet overhead with mock models | pytest-benchmark, CPU |
 | `benchmarks/sim/` | Closed-loop task success **and** runtime behaviour on LIBERO / ManiSkill with a real VLA | Remote GPU host (ADR-020) |
 | `benchmarks/latency/` | Model-level end-to-end latency / sustained FPS of a VLA's native implementation, against a requirement | Remote GPU host, `docker/Dockerfile` image |
 | `benchmarks/closed_loop/` | Real-robot end-to-end latency / FPS: camera frame → policy server → arm command (ARX X5) | Robot host (ROS2 Foxy) + GPU container on the same machine |

@@ -26,7 +26,6 @@ from vla_runtime.action_head.base import (
     RobotState,
     head_supports_rtc,
 )
-from vla_runtime.action_head.diffusion import DiffusionHead
 from vla_runtime.action_head.flow_matching import FlowMatchingHead
 from vla_runtime.action_head.rtc import (
     RTCConfig,
@@ -285,9 +284,16 @@ def test_prepare_guidance_rejects_bad_shapes():
 
 # ── FlowMatchingHead ──────────────────────────────────────────────────────────
 
+class _NoRTCHead:
+    """A head with the core predict() only, no RTC declaration."""
+
+    def predict(self, embedding, robot_state):
+        raise NotImplementedError
+
+
 def test_flow_matching_head_declares_rtc():
     assert head_supports_rtc(make_head())
-    assert not head_supports_rtc(DiffusionHead(action_dim=ACTION_DIM, chunk_size=CHUNK))
+    assert not head_supports_rtc(_NoRTCHead())
 
 
 def test_context_without_previous_actions_samples_like_no_context():
